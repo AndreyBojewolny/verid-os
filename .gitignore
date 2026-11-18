@@ -1,0 +1,4 @@
+target/
+reports/
+*.lock
+__pycache__/

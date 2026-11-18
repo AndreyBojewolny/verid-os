@@ -1,0 +1,25 @@
+TASK-003: reachability v0 — гейт эволюции
+
+## Цель
+Проверка каждого CodeUpdate на «не расширяет overgrant».
+
+## Вход
+- main (журнал + тесты)
+- specs/veridos_evolution_loop_spec_v0.2.md (разделы Инвариант и В4)
+
+## Требования
+1. Модуль reachability: по журналу строится capability-граф (CapGrant/CapRevoke).
+2. Функция overgrant_diff(before, after) -> расширение прав (bool + список).
+3. Гейт: если CodeUpdate расширяет права без human-grant -> отклонение + DLQ.
+4. Ретроспективный режим: overgrant surface за N исполнений (какие capability не использовались).
+
+## Критерии готовности
+- Тесты: расширение прав детектируется, ослабление проходит.
+- Ретроспективный отчёт overgrant surface на тестовом журнале.
+- Комментарии с гарантиями.
+
+## Зона файлов
+- src/reachability/*, tests/
+
+## Формат сдачи
+- Ветка feature/reachability-v0 + отчёт

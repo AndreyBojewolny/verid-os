@@ -1,0 +1,13 @@
+[package]
+name = "veridos-journal"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+blake3 = "1.6"
+bitflags = "2.4"
+smallvec = { version = "1.13", features = ["const_generics"] }
+# TODO: канонический CBOR — Implementer выбирает крейт (ciborium/minicbor) и фиксирует в отчёте
+ciborium = "0.2"
+
+[dev-dependencies]

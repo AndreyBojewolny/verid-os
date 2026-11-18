@@ -1,0 +1,31 @@
+name: veridos-task-pipeline
+description: Последовательный пайплайн для каждой задачи; роли запускаются строго по очереди.
+stages:
+  - name: implement
+    agent: IMPLEMENTER
+    task: tasks/<brief>
+    output:
+      branch: feature/<task-id>
+      artifacts: [src/journal, tests]
+      report: reports/implementer-<task-id>.md
+  - name: verify
+    agent: VERIFIER
+    input: { branch: feature/<task-id> }
+    output:
+      report: reports/verifier-report-<task-id>.md
+  - name: audit
+    agent: AUDITOR
+    input: { branch: feature/<task-id> }
+    output:
+      report: reports/auditor-report-<task-id>.md
+  - name: human-gate
+    role: ARCHITECT (владелец)
+    condition: verifier PASS and auditor PASS -> решение о мерже принадлежит владельцу
+  - name: integrate
+    agent: INTEGRATOR
+    input:
+      branch: feature/<task-id>
+      reports: [reports/verifier-report-<task-id>.md, reports/auditor-report-<task-id>.md]
+    conditions: [verifier.status == PASS, auditor.status == PASS]
+    output:
+      branch: main
