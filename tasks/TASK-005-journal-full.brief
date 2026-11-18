@@ -1,0 +1,70 @@
+TASK-005: полная реализация ядра журнала по спеке (закрытие TASK-001)
+
+## Контекст
+TASK-001 закрыт частично: в ветке feature/journal-core принят только упрощённый
+прототип (`JournalEntry` + `append` + taint-предупреждение, коммиты 8dadb2b, 7cc8d45).
+Вердикт VERIFIER (reports/verifier-journal-core.md): криптография отсутствует,
+Gate TASK-001 не пройден. Этот таск переносит невыполненный объём TASK-001.
+
+## Цель
+Реализовать детерминированный журнал с криптографической целостностью
+строго по specs/veridos_journal_spec_v0.1.md.
+
+## Вход
+- specs/veridos_journal_spec_v0.1.md
+- tasks/TASK-001-journal-core.brief (исходные требования)
+- reports/verifier-journal-core.md (перечень незакрытых пунктов)
+- SKILL.md
+
+## Зона файлов (разрешено менять)
+- src/journal/*, src/lib.rs, tests/*
+- Cargo.toml (только разрешённые зависимости: blake3, bitflags, smallvec,
+  ciborium — выбор CBOR-крейта зафиксировать в отчёте)
+
+## Требования
+1. Перевести `Journal` на `Record` со всеми полями спеки (seq, epoch, domain,
+   source_seq, causality, actor, kind, taint, payload, prev_hash, mac).
+   Судьбу прототипа `JournalEntry` решить явно: удалить или оставить как
+   отдельный совместимый слой — зафиксировать в отчёте.
+2. mac.rs: HKDF-BLAKE3 (root_key -> epoch_key[e] -> mac_key[e,d]),
+   compute_mac / verify_mac (BLAKE3 keyed, 16 байт). Ключи — только параметры
+   функций, в журнале не хранятся.
+3. chain.rs: prev_hash[i] = BLAKE3(канонический CBOR записи[i-1]);
+   append с атомарным пересчётом prev_hash и MAC; verify_chain(range) по ключу
+   эпохи записи.
+4. Операции: append, get(seq), iter(), replay(start_seq), checkpoint() -> Record
+   с state_hash детерминированной модели. События с taint REPLAYED не создают
+   побочных эффектов.
+5. Taint: 9-битный TaintFlags; наследование OR(parents) | флаг источника;
+   UNVALIDATED снимается только операцией Validate (запись в журнал).
+6. cas.rs: in-memory CAS; payload > 4 KB -> BLAKE3-хеш в payload, данные в CAS.
+7. Канонический CBOR-сериализатор Record, бит-в-бит на всех платформах.
+8. Идемпотентность: повторная доставка события не меняет состояние.
+9. event_type -> закрытый словарь EventKind (16 значений); источник
+   недетерминизма (timestamp от вызывающего) устранить или изолировать.
+
+## Критерии готовности (Gate)
+- cargo build --release БЕЗ предупреждений (включая unused dependencies:
+  blake3, ciborium, smallvec должны использоваться либо быть убраны)
+- cargo test проходит; placeholder в tests/journal_tests.rs удалён
+- Мутационный тест: подмена любого 1 байта записи -> verify_chain FAIL
+- Replay: state_hash восстановленной модели совпадает с checkpoint
+- Taint-наследование по OR проверено тестом (включая цепочку родителей)
+- Идемпотентность: повторная доставка события не меняет state_hash
+- CBOR: детерминированность подтверждена тестом (фиксированный вектор байтов)
+
+## Ограничения
+- no_std-совместимость ядра (alloc допускается), минимум аллокаций;
+  eprintln! из прототипа убрать или заменить инъекцией sink
+- Никаких внешних хранилищ и сети
+- Ключи передаются параметрами
+
+## Тестовая гигиена (замечания VERIFIER)
+- Один тестовый файл журнала вместо пары journal_test.rs / journal_tests.rs
+- Негативные кейсы: пустой payload, payload ровно 4 KB и >4 KB, дубликаты
+- Проверка taint-предупреждения через тестируемый sink, не через stderr
+
+## Формат сдачи
+- Ветка feature/journal-full (от feature/journal-core)
+- Отчёт reports/implementer-journal-full.md
+- Верификация: reports/verifier-journal-full.md против Gate этого таска
