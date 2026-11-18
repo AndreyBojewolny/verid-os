@@ -5,6 +5,7 @@ use bitflags::bitflags;
 
 bitflags! {
     /// Taint-флаги записи. Наследование: OR(parents) | флаг источника.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct TaintFlags: u16 {
         const EXTERNAL_NET = 1 << 0;
         const LLM_OUTPUT   = 1 << 1;
