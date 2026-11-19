@@ -9,12 +9,20 @@ if [ "$#" -ne 2 ]; then
     exit 2
 fi
 
+for f in "$1" "$2"; do
+    if [ ! -f "$f" ] || [ ! -r "$f" ]; then
+        echo "FAIL: файл не найден или не читается: $f" >&2
+        exit 2
+    fi
+done
+
 extract() {
     sed -n 's/.*"state_hash"[[:space:]]*:[[:space:]]*"\([0-9a-f]\{64\}\)".*/\1/p' "$1"
 }
 
-a=$(extract "$1")
-b=$(extract "$2")
+# Код ошибки sed зависит от реализации (GNU=2, BSD/busybox=1) — всегда маппим в 2.
+a=$(extract "$1") || exit 2
+b=$(extract "$2") || exit 2
 
 if [ -z "$a" ] || [ -z "$b" ]; then
     echo "FAIL: state_hash (64 hex) не найден в одном из файлов" >&2
