@@ -109,7 +109,7 @@ pub struct EvolutionLoop {
     overgrant_attempts: BTreeMap<u32, u32>,
     budget_left: u64,
     last_heartbeat: u64,
-    queue: Vec<ProposedUpdate>,
+    queue: Vec<(ProposedUpdate, Vec<u64>)>,
     hypothesis_queue: Vec<String>,
     sandbox: Box<dyn Sandbox>,
     sink: Option<Box<dyn WarnSink>>,
@@ -146,7 +146,7 @@ impl EvolutionLoop {
 
     /// Очередь предложений генератора. Гарантирует: порядок FIFO.
     pub fn submit(&mut self, update: ProposedUpdate) {
-        self.queue.push(update);
+        self.queue.push((update, Vec::new()));
     }
 
     /// Текущий ярус деградации.
@@ -171,9 +171,12 @@ impl EvolutionLoop {
 
     /// Тик петли: Monitor -> Analyze -> Plan -> Execute.
     /// external_state_hash — якорь вызывающего для красной линии 2 (приоритет 0).
-    /// Гарантирует: красные линии срабатывают до любых модификаций; все записи
-    /// решений несут model_tier; ключи выводятся из root_key на лету и затираются;
-    /// в не-Running состояниях эволюция не выполняется (только heartbeat в C).
+    /// Гарантирует: целостность журнала проверяется (verify_chain) до любых
+    /// действий; при нарушении — Frozen + алерт, журнал не изменяется
+    /// (консервация); красные линии срабатывают до любых модификаций; все записи
+    /// решений несут model_tier и наследуют taint триггеров по causality;
+    /// ключи выводятся из root_key на лету и затираются; в не-Running
+    /// состояниях эволюция не выполняется (только heartbeat в C).
     pub fn tick(
         &mut self,
         journal: &mut Journal,
@@ -182,6 +185,19 @@ impl EvolutionLoop {
         now: u64,
         external_state_hash: Option<[u8; 32]>,
     ) -> Result<TickReport, AppendError> {
+        if journal.verify_chain(0..journal.len() as u64, root_key).is_err() {
+            self.status = LoopStatus::Frozen;
+            self.alert("RED LINE 2: journal integrity verification failed, evolution frozen, journal left untouched");
+            return Ok(TickReport {
+                triggers: 0,
+                hypotheses: 0,
+                executed: 0,
+                rejected: 0,
+                rolled_back: 0,
+                tier: self.tier,
+                status: self.status,
+            });
+        }
         let mut epoch_key = mac::epoch_key(root_key, epoch);
         let mut key0 = mac::mac_key(&epoch_key, 0);
         let mut key16 = mac::mac_key(&epoch_key, 16);
@@ -193,7 +209,8 @@ impl EvolutionLoop {
     }
 
     /// Действие владельца: разморозка после ручного разбора.
-    /// Гарантирует: сбрасывает статус, счётчики откатов и попыток; журналируется.
+    /// Гарантирует: сбрасывает статус, счётчики откатов и попыток; журналируется;
+    /// ключи затираются на всех путях возврата.
     pub fn owner_resume(
         &mut self,
         journal: &mut Journal,
@@ -202,13 +219,22 @@ impl EvolutionLoop {
     ) -> Result<(), AppendError> {
         let mut epoch_key = mac::epoch_key(root_key, epoch);
         let mut key0 = mac::mac_key(&epoch_key, 0);
+        let result = self.resume_inner(journal, epoch, &key0);
+        mac::zeroize_key(&mut epoch_key);
+        mac::zeroize_key(&mut key0);
+        result
+    }
+
+    fn resume_inner(
+        &mut self,
+        journal: &mut Journal,
+        epoch: u32,
+        key0: &[u8; 32],
+    ) -> Result<(), AppendError> {
         self.status = LoopStatus::Running;
         self.consecutive_rollbacks = 0;
         self.overgrant_attempts.clear();
-        self.cycle(journal, epoch, &key0, "resume", "owner manual review done")?;
-        mac::zeroize_key(&mut epoch_key);
-        mac::zeroize_key(&mut key0);
-        Ok(())
+        self.cycle(journal, epoch, key0, "resume", "owner manual review done")
     }
 
     fn tick_inner(
@@ -254,16 +280,16 @@ impl EvolutionLoop {
             return Ok(report);
         }
 
-        // Monitor: триггеры из новых записей журнала.
-        let mut causes: Vec<String> = Vec::new();
+        // Monitor: триггеры из новых записей журнала (cause + seq источника).
+        let mut causes: Vec<(String, u64)> = Vec::new();
         for rec in journal.iter().skip(self.last_seq as usize) {
             match rec.kind {
                 EventKind::Telemetry => {
                     if let Some((metric, value)) = payload::telemetry_anomaly(&rec.payload) {
-                        causes.push(format!("telemetry:{metric}={value}"));
+                        causes.push((format!("telemetry:{metric}={value}"), rec.seq));
                     }
                 }
-                EventKind::TaskEnd => causes.push(format!("task_end:{}", rec.seq)),
+                EventKind::TaskEnd => causes.push((format!("task_end:{}", rec.seq), rec.seq)),
                 _ => {}
             }
         }
@@ -281,35 +307,39 @@ impl EvolutionLoop {
             }
         }
 
-        // Analyze: гипотезы по правилам.
-        for cause in &causes {
-            self.append(
+        // Analyze: гипотезы по правилам; causality наследует taint триггера.
+        for (cause, trigger_seq) in &causes {
+            let hyp_seq = self.append(
                 journal,
                 epoch,
                 key0,
                 EventKind::Hypothesis,
                 payload::hypothesis(cause),
-                Vec::new(),
+                alloc::vec![*trigger_seq],
             )?;
             report.hypotheses += 1;
             if self.tier == Tier::B {
                 self.hypothesis_queue.push(cause.clone());
             } else {
                 // Plan (правила): аномалия -> доброкачественное обновление клетки.
-                self.queue.push(ProposedUpdate {
-                    target: Target::Cell,
-                    caps_add: Vec::new(),
-                    caps_del: Vec::new(),
-                    canary_pass: true,
-                });
+                self.queue.push((
+                    ProposedUpdate {
+                        target: Target::Cell,
+                        caps_add: Vec::new(),
+                        caps_del: Vec::new(),
+                        canary_pass: true,
+                    },
+                    alloc::vec![hyp_seq],
+                ));
             }
         }
 
         // Execute: только ярус A.
         if self.tier == Tier::A {
             let queue = core::mem::take(&mut self.queue);
-            for update in queue {
-                match self.execute(journal, epoch, key0, key16, &update, &mut report)? {
+            let ctx = ExecCtx { epoch, key0, key16 };
+            for (update, causality) in queue {
+                match self.execute(journal, &ctx, &update, &causality, &mut report)? {
                     ExecOutcome::Continue => {}
                     ExecOutcome::Halt => break,
                 }
@@ -334,12 +364,12 @@ impl EvolutionLoop {
     fn execute(
         &mut self,
         journal: &mut Journal,
-        epoch: u32,
-        key0: &[u8; 32],
-        key16: &[u8; 32],
+        ctx: &ExecCtx<'_>,
         update: &ProposedUpdate,
+        causality: &[u64],
         report: &mut TickReport,
     ) -> Result<ExecOutcome, AppendError> {
+        let &ExecCtx { epoch, key0, key16 } = ctx;
         // Красная линия 1: любое изменение L0 — заморозка до владельца.
         if update.target == Target::L0 {
             self.status = LoopStatus::Frozen;
@@ -354,7 +384,7 @@ impl EvolutionLoop {
             key0,
             EventKind::CodeUpdate,
             payload::code_update(update.target, &update.caps_add, &update.caps_del),
-            Vec::new(),
+            causality.to_vec(),
         )?;
 
         // Сама петля запрещена по построению (CapabilityViolation) — красная линия 3.
@@ -526,4 +556,10 @@ impl EvolutionLoop {
 enum ExecOutcome {
     Continue,
     Halt,
+}
+
+struct ExecCtx<'a> {
+    epoch: u32,
+    key0: &'a [u8; 32],
+    key16: &'a [u8; 32],
 }

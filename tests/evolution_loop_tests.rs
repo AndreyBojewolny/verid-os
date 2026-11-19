@@ -325,3 +325,49 @@ fn applied_update_extends_capabilities_within_gate() {
     assert!(graph.capabilities(ACTOR).is_empty());
     journal.verify_chain(0..journal.len() as u64, &ROOT).expect("chain valid");
 }
+
+#[test]
+fn tainted_telemetry_propagates_through_decisions() {
+    let mut journal = Journal::new();
+    let mut lp = EvolutionLoop::new(config(100, 10));
+    let rec = Record::draft(
+        EPOCH, 0, 0, 900, EventKind::Telemetry,
+        TaintFlags::EXTERNAL_NET | TaintFlags::UNVALIDATED,
+        Vec::new(), payload::telemetry("latency", 500, true),
+    );
+    let trigger_seq = journal.append(rec, &mk(0)).expect("tainted telemetry");
+
+    lp.tick(&mut journal, &ROOT, EPOCH, 1000, None).expect("tick");
+    let hyp = journal.iter().find(|r| r.kind == EventKind::Hypothesis).expect("hypothesis");
+    assert_eq!(hyp.causality, vec![trigger_seq]);
+    assert!(hyp.taint.contains(TaintFlags::EXTERNAL_NET));
+    assert!(hyp.taint.contains(TaintFlags::UNVALIDATED));
+
+    let upd = journal.iter().find(|r| r.kind == EventKind::CodeUpdate).expect("update");
+    assert_eq!(upd.causality, vec![hyp.seq]);
+    assert!(upd.taint.contains(TaintFlags::EXTERNAL_NET));
+
+    let canary = journal.iter().find(|r| r.kind == EventKind::CanaryResult).expect("canary");
+    assert!(canary.taint.contains(TaintFlags::EXTERNAL_NET));
+}
+
+#[test]
+fn tampered_journal_freezes_loop_without_writes() {
+    let mut journal = Journal::new();
+    telemetry(&mut journal, "latency", 500, true);
+    let mut records: Vec<Record> = journal.iter().cloned().collect();
+    records[0].payload[0] ^= 0x01; // подмена байта
+    let mut tampered = Journal::from_records_unchecked(
+        records,
+        veridos_journal::journal::cas::Cas::new(),
+    );
+
+    let mut lp = EvolutionLoop::new(config(100, 10));
+    let sink = CollectSink::default();
+    lp.set_sink(Box::new(sink.clone()));
+    let len = tampered.len();
+    let report = lp.tick(&mut tampered, &ROOT, EPOCH, 1000, None).expect("tick");
+    assert_eq!(report.status, LoopStatus::Frozen);
+    assert_eq!(tampered.len(), len); // консервация: журнал не тронут
+    assert!(sink.0.lock().unwrap().iter().any(|m| m.contains("integrity")));
+}
