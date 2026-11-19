@@ -27,6 +27,9 @@ pub trait WarnSink {
 pub enum AppendError {
     /// causality ссылается на несуществующую запись.
     UnknownParent(u64),
+    /// Validate от актора, не потребившего цель (нет записи с тем же actor
+    /// и causality, содержащим seq цели). Снять UNVALIDATED может только получатель.
+    NotRecipient(u64),
 }
 
 /// Ошибка verify_chain.
@@ -40,6 +43,9 @@ pub enum VerifyError {
     PrevHashMismatch { seq: u64 },
     /// MAC записи невалиден для ключа её эпохи/домена.
     MacMismatch { seq: u64 },
+    /// Журнал не совпадает с внешним якорем (длина, tip_hash или state_hash) —
+    /// усечение, перестановка или расхождение состояния.
+    AnchorMismatch,
 }
 
 /// Ошибка replay.
@@ -52,8 +58,19 @@ pub enum ReplayError {
 /// Ключ дедупликации: (domain, source_seq, actor, kind, BLAKE3(payload до CAS)).
 type DedupKey = (u8, u64, u64, u8, [u8; 32]);
 
+/// Внешний якорь целостности журнала: вызывающий L0 хранит его ОТДЕЛЬНО от
+/// журнала (persistence-этап) и сверяет через verify_anchor — это обнаруживает
+/// усечение хвоста и перестановку, невидимые для самосогласованной цепочки.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Anchor {
+    pub len: u64,
+    pub tip_hash: [u8; 32],
+    pub state_hash: [u8; 32],
+}
+
 /// Детерминированная модель состояния, восстанавливаемая replay.
-/// state_hash — BLAKE3 от фиксированной big-endian кодировки всех полей.
+/// state_hash — BLAKE3 от фиксированной big-endian кодировки всех полей,
+/// включая цепочный аккумулятор (порядок и содержание записей влияют на хеш).
 #[derive(Debug)]
 struct Model {
     applied: u64,
@@ -62,6 +79,7 @@ struct Model {
     kind_counts: SmallVec<[u64; 16]>,
     domain_counts: BTreeMap<u8, u64>,
     validated: BTreeSet<u64>,
+    chain_acc: [u8; 32],
 }
 
 impl Default for Model {
@@ -73,6 +91,7 @@ impl Default for Model {
             kind_counts: smallvec![0u64; 16],
             domain_counts: BTreeMap::new(),
             validated: BTreeSet::new(),
+            chain_acc: [0; 32],
         }
     }
 }
@@ -87,6 +106,10 @@ impl Model {
         if rec.kind == EventKind::Validate {
             self.validated.extend(rec.causality.iter().copied());
         }
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&self.chain_acc);
+        hasher.update(&cbor::encode(rec));
+        self.chain_acc = *hasher.finalize().as_bytes();
     }
 
     fn state_hash(&self) -> [u8; 32] {
@@ -105,6 +128,7 @@ impl Model {
         for &seq in &self.validated {
             hasher.update(&seq.to_be_bytes());
         }
+        hasher.update(&self.chain_acc);
         *hasher.finalize().as_bytes()
     }
 }
@@ -144,11 +168,32 @@ impl Journal {
 
     /// Атомарно добавляет запись: назначает seq, наследует taint по OR родителей,
     /// переносит payload > 4 KB в CAS, пересчитывает prev_hash и MAC.
-    /// Гарантирует: идемпотентность — повторная доставка того же события
-    /// (domain, source_seq, actor, kind, payload) возвращает прежний seq и не
-    /// меняет состояние; запись либо целиком применена, либо журнал не тронут
-    /// (ошибки возможны только до мутации). Ключ mac_key — только параметр.
-    pub fn append(&mut self, mut rec: Record, mac_key: &[u8; 32]) -> Result<u64, AppendError> {
+    /// Гарантирует: служебные флаги VALIDATED/REPLAYED из taint источника
+    /// маскируются (VALIDATED ставит только операция Validate, REPLAYED —
+    /// только append_replayed); Validate принимается лишь от актора, уже
+    /// потребившего цель (иначе NotRecipient); идемпотентность — повторная
+    /// доставка того же события (domain, source_seq, actor, kind, payload)
+    /// возвращает прежний seq и не меняет состояние; запись либо целиком
+    /// применена, либо журнал не тронут (ошибки возможны только до мутации).
+    /// Ключ mac_key — только параметр.
+    pub fn append(&mut self, rec: Record, mac_key: &[u8; 32]) -> Result<u64, AppendError> {
+        self.append_inner(rec, mac_key, false)
+    }
+
+    /// Вход механики replay L0: добавляет событие, помеченное REPLAYED.
+    /// Гарантирует: флаг REPLAYED назначает журнал, а не источник; запись
+    /// не создаёт побочных эффектов (sink молчит); прочие правила append
+    /// (маскирование флагов, авторизация Validate, дедупликация) сохраняются.
+    pub fn append_replayed(&mut self, rec: Record, mac_key: &[u8; 32]) -> Result<u64, AppendError> {
+        self.append_inner(rec, mac_key, true)
+    }
+
+    fn append_inner(
+        &mut self,
+        mut rec: Record,
+        mac_key: &[u8; 32],
+        replayed: bool,
+    ) -> Result<u64, AppendError> {
         let dedup: DedupKey = (
             rec.domain,
             rec.source_seq,
@@ -161,6 +206,7 @@ impl Journal {
         }
 
         let mut taint = rec.taint;
+        taint.remove(TaintFlags::VALIDATED | TaintFlags::REPLAYED);
         for &parent in &rec.causality {
             let parent_rec = self
                 .records
@@ -169,8 +215,20 @@ impl Journal {
             taint |= parent_rec.taint;
         }
         if rec.kind == EventKind::Validate {
+            for &target in &rec.causality {
+                let consumed = self
+                    .records
+                    .iter()
+                    .any(|r| r.actor == rec.actor && r.causality.contains(&target));
+                if !consumed {
+                    return Err(AppendError::NotRecipient(target));
+                }
+            }
             taint.remove(TaintFlags::UNVALIDATED);
             taint.insert(TaintFlags::VALIDATED);
+        }
+        if replayed {
+            taint.insert(TaintFlags::REPLAYED);
         }
         rec.taint = taint;
 
@@ -203,9 +261,11 @@ impl Journal {
         Ok(seq)
     }
 
-    /// Запись по seq (копия). Гарантирует: None, если seq вне журнала.
+    /// Запись по seq (копия). Гарантирует: None, если seq вне журнала;
+    /// корректно и на 32-битных таргетах (без усечения u64 -> usize).
     pub fn get(&self, seq: u64) -> Option<Record> {
-        self.records.get(seq as usize).cloned()
+        let index = usize::try_from(seq).ok()?;
+        self.records.get(index).cloned()
     }
 
     /// Итератор по записям в порядке seq.
@@ -278,11 +338,14 @@ impl Journal {
             if rec.prev_hash != expected_prev {
                 return Err(VerifyError::PrevHashMismatch { seq });
             }
-            let epoch_key = mac::epoch_key(root_key, rec.epoch);
-            let mac_key = mac::mac_key(&epoch_key, rec.domain);
+            let mut epoch_key = mac::epoch_key(root_key, rec.epoch);
+            let mut mac_key = mac::mac_key(&epoch_key, rec.domain);
             let mut unsigned = rec.clone();
             unsigned.mac = [0; 16];
-            if !mac::verify_mac(&mac_key, &cbor::encode(&unsigned), &rec.mac) {
+            let mac_ok = mac::verify_mac(&mac_key, &cbor::encode(&unsigned), &rec.mac);
+            mac::zeroize_key(&mut epoch_key);
+            mac::zeroize_key(&mut mac_key);
+            if !mac_ok {
                 return Err(VerifyError::MacMismatch { seq });
             }
         }
@@ -293,6 +356,31 @@ impl Journal {
     /// Гарантирует: детерминированность; совпадает после replay(0).
     pub fn state_hash(&self) -> [u8; 32] {
         self.model.state_hash()
+    }
+
+    /// Снимок внешнего якоря: длина, BLAKE3 канонического CBOR последней записи
+    /// (нули для пустого журнала) и state_hash модели. Гарантирует:
+    /// детерминированность; вызывающий хранит якорь отдельно от журнала.
+    pub fn anchor(&self) -> Anchor {
+        Anchor {
+            len: self.records.len() as u64,
+            tip_hash: match self.records.last() {
+                Some(last) => *blake3::hash(&cbor::encode(last)).as_bytes(),
+                None => [0; 32],
+            },
+            state_hash: self.model.state_hash(),
+        }
+    }
+
+    /// Сверка журнала с внешним якорем. Гарантирует: обнаруживает усечение
+    /// хвоста, перестановку и любое расхождение длины/состояния/последней
+    /// записи (AnchorMismatch); не заменяет verify_chain, а дополняет его.
+    pub fn verify_anchor(&self, anchor: &Anchor) -> Result<(), VerifyError> {
+        if self.anchor() == *anchor {
+            Ok(())
+        } else {
+            Err(VerifyError::AnchorMismatch)
+        }
     }
 
     /// Доступ к CAS журнала (чтение данных, вынесенных из payload).

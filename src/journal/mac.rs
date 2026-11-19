@@ -39,3 +39,17 @@ pub fn verify_mac(key: &[u8; 32], data: &[u8], mac: &[u8; 16]) -> bool {
     }
     diff == 0
 }
+
+/// Зануление ключевого материала после использования. Гарантирует: volatile-записи
+/// не выбрасываются оптимизатором (в отличие от обычного обнуления мёртвого
+/// буфера); барьер компилятора запрещает перестановку за пределы вызова.
+/// Остаточный риск: внутренние копии ключа в blake3::keyed_hash/derive_key
+/// crate не контролируются — зануление на стороне вызывающего обязательно.
+pub fn zeroize_key(key: &mut [u8; 32]) {
+    for byte in key.iter_mut() {
+        // SAFETY: write_volatile в валидный выровненный байт по &mut-ссылке;
+        // гонки исключены эксклюзивным заимствованием.
+        unsafe { core::ptr::write_volatile(byte, 0) };
+    }
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+}

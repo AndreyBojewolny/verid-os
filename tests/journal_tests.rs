@@ -110,7 +110,10 @@ fn mutation_of_any_single_byte_is_detected() {
 fn replay_restores_state_hash() {
     let mut journal = sample_journal();
     let key = mk(0, 0);
-    let mut validate = draft(EventKind::Validate, 3, Vec::new());
+    let mut consume = draft(EventKind::AgentDecision, 3, Vec::new());
+    consume.causality = vec![1];
+    journal.append(consume, &key).unwrap();
+    let mut validate = draft(EventKind::Validate, 4, Vec::new());
     validate.causality = vec![1];
     journal.append(validate, &key).unwrap();
 
@@ -172,8 +175,10 @@ fn validate_clears_unvalidated_only_via_journal_operation() {
     let p = journal.append(parent, &key).unwrap();
     assert!(journal.get(p).unwrap().taint.contains(TaintFlags::UNVALIDATED));
 
-    let mut validate = draft(EventKind::Validate, 1, Vec::new());
-    validate.causality = vec![p];
+    // Получатель (actor 5) сначала потребляет цель, затем валидирует.
+    let consumer = Record::draft(0, 0, 1, 5, EventKind::AgentDecision, TaintFlags::empty(), vec![p], Vec::new());
+    journal.append(consumer, &key).unwrap();
+    let validate = Record::draft(0, 0, 2, 5, EventKind::Validate, TaintFlags::empty(), vec![p], Vec::new());
     let v = journal.append(validate, &key).unwrap();
     let taint = journal.get(v).unwrap().taint;
     assert!(!taint.contains(TaintFlags::UNVALIDATED));
@@ -183,6 +188,57 @@ fn validate_clears_unvalidated_only_via_journal_operation() {
     let hash_after = journal.state_hash();
     journal.replay(0).unwrap();
     assert_eq!(journal.state_hash(), hash_after);
+}
+
+#[test]
+fn validate_by_non_recipient_is_rejected() {
+    let mut journal = Journal::new();
+    let key = mk(0, 0);
+    let mut parent = draft(EventKind::McpResponse, 0, Vec::new());
+    parent.taint = TaintFlags::UNVALIDATED;
+    let p = journal.append(parent, &key).unwrap();
+    let hash_before = journal.state_hash();
+
+    // actor 9 не потреблял цель — Validate запрещён.
+    let validate = Record::draft(0, 0, 1, 9, EventKind::Validate, TaintFlags::empty(), vec![p], Vec::new());
+    assert_eq!(journal.append(validate, &key), Err(AppendError::NotRecipient(p)));
+    assert_eq!(journal.len(), 1);
+    assert_eq!(journal.state_hash(), hash_before);
+
+    // Чужой актор потребил цель, но Validate заявляет actor 9 — всё равно отказ.
+    let consumer = Record::draft(0, 0, 2, 5, EventKind::AgentDecision, TaintFlags::empty(), vec![p], Vec::new());
+    journal.append(consumer, &key).unwrap();
+    let validate = Record::draft(0, 0, 3, 9, EventKind::Validate, TaintFlags::empty(), vec![p], Vec::new());
+    assert_eq!(journal.append(validate, &key), Err(AppendError::NotRecipient(p)));
+}
+
+#[test]
+fn source_cannot_claim_service_taint_flags() {
+    let mut journal = Journal::new();
+    let sink = CollectSink::default();
+    journal.set_sink(Box::new(sink.clone()));
+    let key = mk(0, 0);
+    let mut claimed = draft(EventKind::McpResponse, 0, Vec::new());
+    claimed.taint = TaintFlags::VALIDATED | TaintFlags::REPLAYED | TaintFlags::LLM_OUTPUT;
+    let seq = journal.append(claimed, &key).unwrap();
+    assert_eq!(journal.get(seq).unwrap().taint, TaintFlags::LLM_OUTPUT);
+    // Без REPLAYED предупреждение не подавляется.
+    assert_eq!(sink.0.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn append_replayed_assigns_flag_and_stays_silent() {
+    let mut journal = Journal::new();
+    let sink = CollectSink::default();
+    journal.set_sink(Box::new(sink.clone()));
+    let key = mk(0, 0);
+    let mut event = draft(EventKind::ReplayEvent, 0, Vec::new());
+    event.taint = TaintFlags::LLM_OUTPUT;
+    let seq = journal.append_replayed(event, &key).unwrap();
+    let taint = journal.get(seq).unwrap().taint;
+    assert!(taint.contains(TaintFlags::REPLAYED));
+    assert!(taint.contains(TaintFlags::LLM_OUTPUT));
+    assert_eq!(sink.0.lock().unwrap().len(), 0);
 }
 
 #[test]
@@ -286,8 +342,8 @@ fn sink_receives_warnings_and_replayed_is_silent() {
     assert_eq!(sink.0.lock().unwrap().len(), 1);
 
     let mut replayed = draft(EventKind::ReplayEvent, 1, Vec::new());
-    replayed.taint = TaintFlags::REPLAYED | TaintFlags::LLM_OUTPUT;
-    journal.append(replayed, &key).unwrap();
+    replayed.taint = TaintFlags::LLM_OUTPUT;
+    journal.append_replayed(replayed, &key).unwrap();
     assert_eq!(sink.0.lock().unwrap().len(), 1);
 
     journal.replay(0).unwrap();
@@ -358,4 +414,43 @@ fn unknown_parent_is_rejected_without_side_effects() {
     assert_eq!(journal.append(orphan, &key), Err(AppendError::UnknownParent(99)));
     assert!(journal.is_empty());
     assert_eq!(journal.state_hash(), hash_before);
+}
+
+#[test]
+fn get_rejects_out_of_range_seq_without_truncation() {
+    let journal = sample_journal();
+    assert!(journal.get(1 << 32).is_none());
+    assert!(journal.get(u64::MAX).is_none());
+    assert!(journal.get(3).is_none());
+    assert!(journal.get(2).is_some());
+}
+
+#[test]
+fn anchor_detects_truncation_and_reorder() {
+    let journal = sample_journal();
+    let anchor = journal.anchor();
+    assert!(journal.verify_anchor(&anchor).is_ok());
+    assert_eq!(anchor.len, 3);
+
+    let records: Vec<Record> = journal.iter().cloned().collect();
+    let mut shorter = records.clone();
+    shorter.pop();
+    let truncated = Journal::from_records_unchecked(shorter, Cas::new());
+    assert_eq!(truncated.verify_anchor(&anchor), Err(VerifyError::AnchorMismatch));
+
+    let mut swapped = records;
+    swapped.swap(0, 1);
+    let reordered = Journal::from_records_unchecked(swapped, Cas::new());
+    assert_eq!(reordered.verify_anchor(&anchor), Err(VerifyError::AnchorMismatch));
+
+    let empty = Journal::new();
+    assert!(empty.verify_anchor(&empty.anchor()).is_ok());
+    assert_eq!(empty.anchor().tip_hash, [0; 32]);
+}
+
+#[test]
+fn zeroize_key_clears_key_material() {
+    let mut key = [0xABu8; 32];
+    mac::zeroize_key(&mut key);
+    assert_eq!(key, [0u8; 32]);
 }
