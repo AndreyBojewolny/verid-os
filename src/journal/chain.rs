@@ -208,9 +208,9 @@ impl Journal {
         let mut taint = rec.taint;
         taint.remove(TaintFlags::VALIDATED | TaintFlags::REPLAYED);
         for &parent in &rec.causality {
-            let parent_rec = self
-                .records
-                .get(parent as usize)
+            let parent_rec = usize::try_from(parent)
+                .ok()
+                .and_then(|index| self.records.get(index))
                 .ok_or(AppendError::UnknownParent(parent))?;
             taint |= parent_rec.taint;
         }

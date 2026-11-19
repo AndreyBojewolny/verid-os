@@ -414,6 +414,15 @@ fn unknown_parent_is_rejected_without_side_effects() {
     assert_eq!(journal.append(orphan, &key), Err(AppendError::UnknownParent(99)));
     assert!(journal.is_empty());
     assert_eq!(journal.state_hash(), hash_before);
+
+    // seq за пределами usize (32-бит таргеты) не должен усекаться до валидного индекса.
+    let mut overflow = draft(EventKind::AgentDecision, 1, Vec::new());
+    overflow.causality = vec![u64::MAX];
+    assert_eq!(
+        journal.append(overflow, &key),
+        Err(AppendError::UnknownParent(u64::MAX))
+    );
+    assert!(journal.is_empty());
 }
 
 #[test]
