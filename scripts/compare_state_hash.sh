@@ -18,7 +18,7 @@ b=$(extract "$2")
 
 if [ -z "$a" ] || [ -z "$b" ]; then
     echo "FAIL: state_hash (64 hex) не найден в одном из файлов" >&2
-    exit 1
+    exit 2
 fi
 
 if [ "$a" = "$b" ]; then

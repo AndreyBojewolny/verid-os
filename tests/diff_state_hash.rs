@@ -2,7 +2,8 @@
 //!
 //! Сценарий diff-v1: детерминированный генератор (без RNG/времени) строит
 //! >= 1000 записей — все 16 EventKind, 4 эпохи, 3 домена, 5 акторов,
-//! payload до 5000 байт (CAS-вынос > 4 KB), Validate с записями-потреблениями,
+//! payload до 1199 байт (порог CAS-выноса 4096 не достигается; покрытие
+//! >4KB — бэклог этапа B), Validate с записями-потреблениями,
 //! checkpoint каждые 200 событий, REPLAYED каждые 100. Replay(0) обязан
 //! воспроизвести state_hash побитно; второй независимый прогон и пересборка
 //! из записей дают тот же хеш. Хеш фиксируется в reports/state_hash.json
@@ -118,6 +119,9 @@ fn diff_v1_state_hash_is_deterministic() {
         hash_hex,
         hex(&anchor.tip_hash),
     );
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("reports").join("state_hash.json");
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("reports");
+    // reports/ gitignored: на fresh clone каталога нет — тест самодостаточен.
+    fs::create_dir_all(&dir).expect("reports/ создаётся для записи state_hash.json");
+    let path = dir.join("state_hash.json");
     fs::write(&path, json).expect("reports/ доступен для записи state_hash.json");
 }
