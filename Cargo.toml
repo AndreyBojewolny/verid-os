@@ -4,10 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-blake3 = "1.6"
+blake3 = { version = "1.6", default-features = false }
 bitflags = "2.4"
 smallvec = { version = "1.13", features = ["const_generics"] }
-# TODO: канонический CBOR — Implementer выбирает крейт (ciborium/minicbor) и фиксирует в отчёте
-ciborium = "0.2"
+ciborium = { version = "0.2", default-features = false }
 
 [dev-dependencies]

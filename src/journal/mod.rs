@@ -1,6 +1,11 @@
-//! Модуль журнала. Скелет: TODO-заглушки для TASK-001.
+//! Модуль журнала: детерминированные записи с криптографической целостностью.
+//! См. specs/veridos_journal_spec_v0.1.md.
 
-pub mod record;
-pub mod mac;
-pub mod chain;
 pub mod cas;
+pub mod cbor;
+pub mod chain;
+pub mod mac;
+pub mod record;
+
+pub use chain::{Anchor, AppendError, Journal, ReplayError, VerifyError, WarnSink};
+pub use record::{EventKind, Record, TaintFlags};
