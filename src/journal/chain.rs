@@ -77,6 +77,9 @@ struct Model {
     last_seq: u64,
     taint_acc: TaintFlags,
     kind_counts: SmallVec<[u64; 16]>,
+    // kinds 16..20 (петля эволюции): отдельная секция, входит в state_hash
+    // только когда непуста — хеш сценариев без новых kinds не меняется.
+    loop_kind_counts: BTreeMap<u8, u64>,
     domain_counts: BTreeMap<u8, u64>,
     validated: BTreeSet<u64>,
     chain_acc: [u8; 32],
@@ -89,6 +92,7 @@ impl Default for Model {
             last_seq: 0,
             taint_acc: TaintFlags::empty(),
             kind_counts: smallvec![0u64; 16],
+            loop_kind_counts: BTreeMap::new(),
             domain_counts: BTreeMap::new(),
             validated: BTreeSet::new(),
             chain_acc: [0; 32],
@@ -101,7 +105,12 @@ impl Model {
         self.applied += 1;
         self.last_seq = rec.seq;
         self.taint_acc |= rec.taint;
-        self.kind_counts[rec.kind.as_u8() as usize] += 1;
+        let kind_code = rec.kind.as_u8();
+        if kind_code < 16 {
+            self.kind_counts[kind_code as usize] += 1;
+        } else {
+            *self.loop_kind_counts.entry(kind_code).or_insert(0) += 1;
+        }
         *self.domain_counts.entry(rec.domain).or_insert(0) += 1;
         if rec.kind == EventKind::Validate {
             self.validated.extend(rec.causality.iter().copied());
@@ -127,6 +136,10 @@ impl Model {
         }
         for &seq in &self.validated {
             hasher.update(&seq.to_be_bytes());
+        }
+        for (&kind, &count) in &self.loop_kind_counts {
+            hasher.update(&[kind]);
+            hasher.update(&count.to_be_bytes());
         }
         hasher.update(&self.chain_acc);
         *hasher.finalize().as_bytes()

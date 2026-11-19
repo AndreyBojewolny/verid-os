@@ -11,3 +11,5 @@ extern crate alloc;
 
 pub mod journal;
 pub mod reachability;
+#[path = "loop/mod.rs"]
+pub mod evolution_loop;
