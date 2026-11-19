@@ -355,14 +355,43 @@ fn sink_receives_warnings_and_replayed_is_silent() {
 
 #[test]
 fn event_kind_dictionary_is_closed() {
-    for code in 0..=15u8 {
+    for code in 0..=20u8 {
         let kind = EventKind::from_u8(code).unwrap();
         assert_eq!(kind.as_u8(), code);
     }
-    for code in 16..=255u8 {
+    for code in 21..=255u8 {
         assert!(EventKind::from_u8(code).is_none());
     }
     assert!(TaintFlags::from_bits(1 << 9).is_none());
+}
+
+#[test]
+fn loop_event_kinds_roundtrip_and_replay() {
+    let key = mk(0, 0);
+    let mut journal = Journal::new();
+    let base_hash = journal.state_hash();
+    for kind in [
+        EventKind::Telemetry,
+        EventKind::Hypothesis,
+        EventKind::CodeUpdate,
+        EventKind::CanaryResult,
+        EventKind::EvolutionCycle,
+    ] {
+        journal.append(draft(kind, journal.len() as u64, vec![1, 2, 3]), &key).unwrap();
+    }
+    journal.verify_chain(0..journal.len() as u64, &ROOT).unwrap();
+    let hash = journal.state_hash();
+    assert_ne!(hash, base_hash);
+    journal.replay(0).unwrap();
+    assert_eq!(journal.state_hash(), hash);
+
+    let records: Vec<Record> = journal.iter().cloned().collect();
+    let rebuilt = Journal::from_records_unchecked(records, Cas::new());
+    assert_eq!(rebuilt.state_hash(), hash);
+    for rec in journal.iter() {
+        assert!(rec.kind.as_u8() >= 16);
+        assert_eq!(cbor::decode(&cbor::encode(rec)).unwrap(), *rec);
+    }
 }
 
 #[test]

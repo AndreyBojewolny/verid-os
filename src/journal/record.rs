@@ -32,7 +32,8 @@ impl TaintFlags {
         .union(TaintFlags::DLQ);
 }
 
-/// Виды событий — закрытый словарь из 16 значений (порядок = коды 0..15).
+/// Виды событий — закрытый словарь из 21 значения (порядок = коды 0..20).
+/// 16..20 — события петли эволюции (specs/veridos_evolution_loop_spec_v0.2.md).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EventKind {
     CapGrant,
@@ -51,15 +52,20 @@ pub enum EventKind {
     TaskEnd,
     CellSpawn,
     CellHalt,
+    Telemetry,
+    Hypothesis,
+    CodeUpdate,
+    CanaryResult,
+    EvolutionCycle,
 }
 
 impl EventKind {
-    /// Код события для сериализации. Гарантирует: значение в 0..=15.
+    /// Код события для сериализации. Гарантирует: значение в 0..=20.
     pub fn as_u8(self) -> u8 {
         self as u8
     }
 
-    /// Разбор кода события. Гарантирует: None для любого кода вне 0..=15
+    /// Разбор кода события. Гарантирует: None для любого кода вне 0..=20
     /// (словарь закрытый, расширению не подлежит).
     pub fn from_u8(code: u8) -> Option<Self> {
         Some(match code {
@@ -79,6 +85,11 @@ impl EventKind {
             13 => Self::TaskEnd,
             14 => Self::CellSpawn,
             15 => Self::CellHalt,
+            16 => Self::Telemetry,
+            17 => Self::Hypothesis,
+            18 => Self::CodeUpdate,
+            19 => Self::CanaryResult,
+            20 => Self::EvolutionCycle,
             _ => return None,
         })
     }

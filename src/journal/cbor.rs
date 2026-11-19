@@ -47,7 +47,7 @@ pub fn encode(rec: &Record) -> Vec<u8> {
 
 /// Разбор канонического CBOR в запись. Гарантирует: принимает только map ровно
 /// из 11 известных полей с ожидаемыми типами и длинами; закрытые словари
-/// EventKind (0..=15) и TaintFlags (9 бит) проверяются, иначе CborError::Shape.
+/// EventKind (0..=20) и TaintFlags (9 бит) проверяются, иначе CborError::Shape.
 pub fn decode(bytes: &[u8]) -> Result<Record, CborError> {
     let value: Value = ciborium::de::from_reader(bytes).map_err(|_| CborError::Syntax)?;
     let map = match value {
