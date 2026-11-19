@@ -1,0 +1,32 @@
+#!/bin/sh
+# TASK-002: побитное сравнение state_hash из двух JSON-отчётов.
+# Использование: scripts/compare_state_hash.sh <hosted.json> <native.json>
+# Выход: 0 = PASS (хешы идентичны), 1 = FAIL (расхождение), 2 = ошибка ввода.
+set -eu
+
+if [ "$#" -ne 2 ]; then
+    echo "usage: $0 <a.json> <b.json>" >&2
+    exit 2
+fi
+
+extract() {
+    sed -n 's/.*"state_hash"[[:space:]]*:[[:space:]]*"\([0-9a-f]\{64\}\)".*/\1/p' "$1"
+}
+
+a=$(extract "$1")
+b=$(extract "$2")
+
+if [ -z "$a" ] || [ -z "$b" ]; then
+    echo "FAIL: state_hash (64 hex) не найден в одном из файлов" >&2
+    exit 1
+fi
+
+if [ "$a" = "$b" ]; then
+    echo "PASS: state_hash идентичны побитно ($a)"
+    exit 0
+else
+    echo "FAIL: state_hash расходятся" >&2
+    echo "  $1: $a" >&2
+    echo "  $2: $b" >&2
+    exit 1
+fi
