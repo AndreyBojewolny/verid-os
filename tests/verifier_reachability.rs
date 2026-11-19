@@ -218,3 +218,28 @@ fn deterministic_reports_across_identical_journals() {
     );
     assert_eq!(CapabilityGraph::from_journal(&j1).pairs(), CapabilityGraph::from_journal(&j2).pairs());
 }
+
+#[test]
+fn non_canonical_human_grant_does_not_authorize() {
+    let mut journal = Journal::new();
+    grant(&mut journal, 16, 1, "fs.read");
+    let before = CapabilityGraph::from_journal(&journal);
+
+    // Human-grant (домен 0) в неканонической длинной форме CBOR text:
+    // не должен ни авторизовать расширение, ни пройти незаметно.
+    let mut after_j = Journal::new();
+    grant(&mut after_j, 16, 1, "fs.read");
+    let mut long_form = vec![0x78, 0x08];
+    long_form.extend_from_slice(b"key.sign");
+    let bad_seq = append(&mut after_j, 0, 1, EventKind::CapGrant, long_form);
+    let after = CapabilityGraph::from_journal(&after_j);
+
+    let verdict = gate_code_update(&mut journal, &key(0), EPOCH, 1, &before, &after).expect("gate");
+    match verdict {
+        GateVerdict::Reject { malformed, dlq_seq, .. } => {
+            assert_eq!(malformed, vec![bad_seq]);
+            assert!(journal.get(dlq_seq).expect("dlq").taint.contains(TaintFlags::DLQ));
+        }
+        GateVerdict::Allow => panic!("non-canonical human-grant must fail closed"),
+    }
+}
