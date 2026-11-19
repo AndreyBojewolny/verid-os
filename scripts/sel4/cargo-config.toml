@@ -1,0 +1,17 @@
+# TASK-002, этап B: cargo-конфиг для no_std-таргета seL4 userland.
+# ВАЖНО: скопировать в .cargo/config.toml репозитория (каталог .cargo/
+# вне зоны файлов TASK-002, поэтому конфиг поставляется здесь).
+# Альтернатива без копирования: cargo build --release --lib --target thumbv7em-none-eabihf
+#
+# Таргет зависит от платформы seL4:
+#   ARMv7-M (например, i.MX6/ODroid): thumbv7em-none-eabihf
+#   AArch64 (например, RPi4/QEMU virt): aarch64-unknown-none
+# Перед сборкой: rustup target add <таргет>
+
+[build]
+target = "thumbv7em-none-eabihf"
+
+[target.thumbv7em-none-eabihf]
+rustflags = ["-C", "panic=abort"]
+# runner этапа B: загрузчик seL4 userland-образа (определяется платформой),
+# например: runner = "sel4-loader --image"
