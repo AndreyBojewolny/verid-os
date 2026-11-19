@@ -2,10 +2,14 @@
 //!
 //! Соглашения v0:
 //! - payload событий CapGrant/CapRevoke/McpRequest — канонический CBOR text
-//!   string с именем capability; записи с иным payload графом игнорируются.
+//!   string с именем capability; неканонические и невалидные payload
+//!   не декодируются, а их seq попадают в malformed_events (fail-closed).
 //! - human-grant — CapGrant в домене 0 (L0, владелец).
 //! - использование capability — McpRequest актора-держателя с именем capability
 //!   в payload.
+//!
+//! Предусловие: вызывающий обязан проверить целостность журнала
+//! (verify_chain/verify_anchor) до построения графа — граф читает записи как есть.
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
@@ -22,6 +26,7 @@ use crate::journal::{EventKind, Journal};
 pub struct CapabilityGraph {
     grants: BTreeMap<u64, BTreeSet<String>>,
     human_granted: BTreeSet<(u64, String)>,
+    malformed: Vec<u64>,
 }
 
 /// Расширение прав между двумя графами.
@@ -60,11 +65,12 @@ pub fn encode_cap(name: &str) -> Vec<u8> {
     buf
 }
 
-/// Разбор payload события capability. Гарантирует: None для любого payload,
-/// не являющегося CBOR text string (такие записи граф игнорирует).
+/// Разбор payload события capability. Гарантирует: принимает только
+/// канонический CBOR text string (бит-в-бит совпадающий с encode_cap);
+/// None для любого иного payload — такие события граф помечает malformed.
 pub fn decode_cap(payload: &[u8]) -> Option<String> {
     match ciborium::de::from_reader::<Value, _>(payload) {
-        Ok(Value::Text(name)) => Some(name),
+        Ok(Value::Text(name)) if encode_cap(&name) == payload => Some(name),
         _ => None,
     }
 }
@@ -72,11 +78,13 @@ pub fn decode_cap(payload: &[u8]) -> Option<String> {
 impl CapabilityGraph {
     /// Граф по всему журналу. Гарантирует: детерминированность (порядок seq);
     /// CapGrant добавляет пару, CapRevoke удаляет пару и её human-grant статус;
-    /// записи других видов и с не-CBOR-text payload не влияют на граф.
+    /// CapGrant/CapRevoke с невалидным payload попадают в malformed_events;
+    /// записи других видов на граф не влияют. Предусловие целостности —
+    /// verify_chain/verify_anchor на стороне вызывающего.
     pub fn from_journal(journal: &Journal) -> Self {
         let mut graph = Self::default();
         for rec in journal.iter() {
-            graph.apply(rec.kind, rec.domain, rec.actor, &rec.payload);
+            graph.apply(rec.kind, rec.domain, rec.actor, rec.seq, &rec.payload);
         }
         graph
     }
@@ -87,16 +95,19 @@ impl CapabilityGraph {
         check_window(journal, &window)?;
         let mut graph = Self::default();
         for rec in journal.iter().skip(window.start as usize).take((window.end - window.start) as usize) {
-            graph.apply(rec.kind, rec.domain, rec.actor, &rec.payload);
+            graph.apply(rec.kind, rec.domain, rec.actor, rec.seq, &rec.payload);
         }
         Ok(graph)
     }
 
-    fn apply(&mut self, kind: EventKind, domain: u8, actor: u64, payload: &[u8]) {
+    fn apply(&mut self, kind: EventKind, domain: u8, actor: u64, seq: u64, payload: &[u8]) {
         let name = match kind {
             EventKind::CapGrant | EventKind::CapRevoke => match decode_cap(payload) {
                 Some(name) => name,
-                None => return,
+                None => {
+                    self.malformed.push(seq);
+                    return;
+                }
             },
             _ => return,
         };
@@ -134,6 +145,13 @@ impl CapabilityGraph {
     /// Пары, выданные явным human-grant (домен 0) и не отозванные.
     pub fn human_granted(&self) -> &BTreeSet<(u64, String)> {
         &self.human_granted
+    }
+
+    /// Seq событий CapGrant/CapRevoke с невалидным payload (не канонический
+    /// CBOR text). Гарантирует: порядок seq; непустой список означает, что
+    /// граф не видит часть грантов — вызывающий обязан fail-closed.
+    pub fn malformed_events(&self) -> &[u64] {
+        &self.malformed
     }
 }
 

@@ -70,7 +70,7 @@ fn partial_human_coverage_rejects_only_unauthorized() {
 
     let verdict = gate_code_update(&mut journal, &key(0), EPOCH, 1, &before, &after).expect("gate");
     match verdict {
-        GateVerdict::Reject { added, dlq_seq } => {
+        GateVerdict::Reject { added, dlq_seq, .. } => {
             assert_eq!(added, vec![(1, "cap.b".into())]);
             let dlq = journal.get(dlq_seq).expect("dlq");
             assert_eq!(dlq.kind, EventKind::DlqEntry);

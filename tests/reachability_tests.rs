@@ -78,7 +78,7 @@ fn gate_rejects_expansion_and_writes_dlq() {
     let len_before = journal.len();
     let verdict = gate_code_update(&mut journal, &KEY, EPOCH, CELL, &before, &after).expect("gate");
     match verdict {
-        GateVerdict::Reject { added, dlq_seq } => {
+        GateVerdict::Reject { added, dlq_seq, .. } => {
             assert_eq!(added, vec![(CELL, "key.sign".into())]);
             assert_eq!(dlq_seq, len_before as u64);
         }
@@ -160,4 +160,68 @@ fn surface_window_bounds_checked() {
     );
     let (start, end) = (2u64, 1u64);
     assert_eq!(overgrant_surface(&journal, start..end), Err(SurfaceError::OutOfRange));
+}
+
+#[test]
+fn non_canonical_payload_is_malformed() {
+    use veridos_journal::reachability::decode_cap;
+    // "fs.read" в длинной форме CBOR text (0x78 0x07) — не канон.
+    let mut long_form = vec![0x78, 0x07];
+    long_form.extend_from_slice(b"fs.read");
+    assert_eq!(decode_cap(&long_form), None);
+    assert_eq!(decode_cap(&encode_cap("fs.read")), Some("fs.read".into()));
+
+    let mut journal = Journal::new();
+    let rec = Record::draft(
+        EPOCH, 16, 0, CELL, EventKind::CapGrant, TaintFlags::empty(), Vec::new(), long_form,
+    );
+    let seq = journal.append(rec, &KEY).expect("append");
+    let graph = CapabilityGraph::from_journal(&journal);
+    assert!(graph.capabilities(CELL).is_empty());
+    assert_eq!(graph.malformed_events(), &[seq]);
+}
+
+#[test]
+fn malformed_event_in_after_fails_closed() {
+    let mut journal = journal_with_grants();
+    let before = CapabilityGraph::from_journal(&journal);
+
+    let mut after_journal = journal_with_grants();
+    let rec = Record::draft(
+        EPOCH, 16, after_journal.len() as u64, CELL, EventKind::CapGrant,
+        TaintFlags::empty(), Vec::new(), vec![0xff],
+    );
+    let bad_seq = after_journal.append(rec, &KEY).expect("append");
+    let after = CapabilityGraph::from_journal(&after_journal);
+
+    // Расширения в графе нет, но malformed-грант невидим -> fail-closed.
+    assert!(!overgrant_diff(&before, &after).expanded);
+    let verdict = gate_code_update(&mut journal, &KEY, EPOCH, CELL, &before, &after).expect("gate");
+    match verdict {
+        GateVerdict::Reject { added, malformed, dlq_seq } => {
+            assert!(added.is_empty());
+            assert_eq!(malformed, vec![bad_seq]);
+            assert!(journal.get(dlq_seq).expect("dlq").taint.contains(TaintFlags::DLQ));
+        }
+        GateVerdict::Allow => panic!("malformed grant must fail closed"),
+    }
+}
+
+#[test]
+fn malformed_event_in_before_fails_closed() {
+    let mut journal = Journal::new();
+    append(&mut journal, 16, CELL, EventKind::CapGrant, "fs.read");
+    let rec = Record::draft(
+        EPOCH, 16, journal.len() as u64, CELL, EventKind::CapRevoke,
+        TaintFlags::empty(), Vec::new(), vec![0xff],
+    );
+    let bad_seq = journal.append(rec, &KEY).expect("append");
+    let before = CapabilityGraph::from_journal(&journal);
+    let after = before.clone();
+
+    let verdict = gate_code_update(&mut journal, &KEY, EPOCH, CELL, &before, &after).expect("gate");
+    match verdict {
+        GateVerdict::Reject { malformed, .. } => assert_eq!(malformed, vec![bad_seq]),
+        GateVerdict::Allow => panic!("malformed revoke in before must fail closed"),
+    }
 }
