@@ -327,3 +327,96 @@ fn injected_metrics_sandbox_honors_its_own_tolerance() {
     let r = lp.tick(&mut journal, &ROOT, EPOCH, 1000, None).expect("tick");
     assert_eq!(r.executed, 1);
 }
+
+// --- Повторная проверка фикса AUD-1: строгие флаги anomaly/canary. ---
+
+fn raw(metric: &str, value: i64, anomaly: i64, canary: Option<i64>) -> Vec<u8> {
+    let mut entries = vec![
+        (Value::Text("metric".into()), Value::Text(metric.into())),
+        (Value::Text("value".into()), Value::Integer(value.into())),
+        (Value::Text("anomaly".into()), Value::Integer(anomaly.into())),
+    ];
+    if let Some(c) = canary {
+        entries.push((Value::Text("canary".into()), Value::Integer(c.into())));
+    }
+    let mut buf = Vec::new();
+    ciborium::ser::into_writer(&Value::Map(entries), &mut buf).expect("cbor");
+    buf
+}
+
+fn append_raw(journal: &mut Journal, domain: u8, payload_bytes: Vec<u8>) -> u64 {
+    let rec = Record::draft(
+        EPOCH, domain, journal.len() as u64, 900, EventKind::Telemetry,
+        TaintFlags::empty(), Vec::new(), payload_bytes,
+    );
+    journal.append(rec, &mk(domain)).expect("raw telemetry")
+}
+
+#[test]
+fn negative_and_huge_flags_are_invalid() {
+    for anomaly in [-1i64, 2, i64::MAX] {
+        let mut journal = Journal::new();
+        append_raw(&mut journal, 0, raw("latency", 1_000_000, anomaly, None));
+        tel(&mut journal, 0, 900, "errors", 0, false, TaintFlags::empty());
+        let mut lp = EvolutionLoop::new(config(25));
+        lp.submit(upd(&[], &[]), Vec::new());
+        let r = lp.tick(&mut journal, &ROOT, EPOCH, 1000, None).expect("tick");
+        assert_eq!(r.triggers, 0, "anomaly={anomaly} не триггер");
+        assert_eq!(r.rolled_back, 1, "anomaly={anomaly} не база");
+        assert_eq!(reason(&journal), Some(Value::Text("no-baseline".into())));
+    }
+    for canary in [-1i64, 2, i64::MAX] {
+        let mut journal = Journal::new();
+        append_raw(&mut journal, 0, raw("latency", 200, 0, Some(canary)));
+        tel(&mut journal, 0, 900, "errors", 0, false, TaintFlags::empty());
+        let mut lp = EvolutionLoop::new(config(25));
+        lp.submit(upd(&[], &[]), Vec::new());
+        let r = lp.tick(&mut journal, &ROOT, EPOCH, 1000, None).expect("tick");
+        assert_eq!(r.rolled_back, 1, "canary={canary} не фон");
+        assert_eq!(reason(&journal), Some(Value::Text("no-baseline".into())));
+    }
+}
+
+#[test]
+fn parser_unit_strict_flags() {
+    assert_eq!(payload::telemetry_metric(&raw("latency", 5, 0, None)), Some(("latency".into(), 5, false, false)));
+    assert_eq!(payload::telemetry_metric(&raw("latency", 5, 1, None)), Some(("latency".into(), 5, true, false)));
+    assert_eq!(payload::telemetry_metric(&raw("latency", 5, 0, Some(0))), Some(("latency".into(), 5, false, false)));
+    assert_eq!(payload::telemetry_metric(&raw("latency", 5, 0, Some(1))), Some(("latency".into(), 5, false, true)));
+    for anomaly in [-1i64, 2, 3, i64::MAX, i64::MIN] {
+        assert_eq!(payload::telemetry_metric(&raw("latency", 5, anomaly, None)), None, "anomaly={anomaly}");
+        assert_eq!(payload::telemetry_anomaly(&raw("latency", 5, anomaly, None)), None);
+    }
+    for canary in [-1i64, 2, i64::MAX] {
+        assert_eq!(payload::telemetry_metric(&raw("latency", 5, 0, Some(canary))), None, "canary={canary}");
+    }
+}
+
+#[test]
+fn canary_anomaly_record_triggers_but_is_not_baseline() {
+    let mut journal = Journal::new();
+    baseline(&mut journal, 200, 0);
+    // Внешняя запись anomaly=1 canary=1: триггерит Monitor, но базой не является.
+    append_raw(&mut journal, 0, raw("latency", 999, 1, Some(1)));
+    let mut lp = EvolutionLoop::new(config(25));
+    lp.submit(upd(&[], &[]), Vec::new());
+    let r = lp.tick(&mut journal, &ROOT, EPOCH, 1000, None).expect("tick");
+    assert_eq!(r.triggers, 1);
+    assert_eq!(r.executed, 2); // авто-обновление + поданное, оба по чистой базе
+    assert_eq!(reason(&journal), Some(Value::Text("non-regression".into())));
+}
+
+#[test]
+fn invalid_flag_cell_telemetry_cannot_authorize() {
+    // Связка OBS-1 + AUD-1 закрыта для невалидных флагов: клеточная телеметрия
+    // с anomaly=2 и огромной latency не создаёт базу.
+    let mut journal = Journal::new();
+    append_raw(&mut journal, 16, raw("latency", 1_000_000, 2, None));
+    tel(&mut journal, 16, 555, "errors", 0, false, TaintFlags::empty());
+    let mut lp = EvolutionLoop::new(config(25));
+    lp.submit(upd(&[], &[]), Vec::new());
+    let r = lp.tick(&mut journal, &ROOT, EPOCH, 1000, None).expect("tick");
+    assert_eq!(r.rolled_back, 1);
+    assert_eq!(reason(&journal), Some(Value::Text("no-baseline".into())));
+    journal.verify_chain(0..journal.len() as u64, &ROOT).expect("chain valid");
+}
