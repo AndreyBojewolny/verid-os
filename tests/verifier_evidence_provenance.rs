@@ -179,7 +179,7 @@ impl Sandbox for ActorEpochProbe {
         ctx: &mut CanaryCtx<'_>,
     ) -> Result<CanaryOutcome, AppendError> {
         // Чтение через handle видит журнал.
-        assert!(ctx.journal.journal().len() > 0);
+        assert!(!ctx.journal.journal().is_empty());
         let seq = ctx.journal.record_canary("latency", 7)?;
         let rec = ctx.journal.journal().get(seq).expect("canary record");
         assert_eq!(rec.actor, ACTOR, "актор канарейки = актор петли");
