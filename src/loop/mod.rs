@@ -4,13 +4,15 @@
 //! Гарантии модуля: no_std (alloc), без LLM (model_tier = "rules" в каждой
 //! записи решения); 5 красных линий — константы, override не существует;
 //! ключи не хранятся (root_key — параметр, доменные ключи выводятся и затираются);
-//! все переходы петли журналируются событиями EvolutionCycle.
+//! все переходы петли журналируются событиями EvolutionCycle; исход канарейки
+//! определяет независимый checker MetricsSandbox (TASK-008), а не самооценка
+//! генератора.
 
 pub mod engine;
 pub mod payload;
 
 pub use engine::{
-    Config, EvolutionLoop, LoopStatus, ProposedUpdate, RulesSandbox, Sandbox, TickReport, Tier,
-    MAX_CONSECUTIVE_ROLLBACKS, MAX_OVERGRANT_ATTEMPTS_PER_EPOCH,
+    CanaryCtx, Config, EvolutionLoop, LoopStatus, MetricsSandbox, ProposedUpdate, RulesSandbox,
+    Sandbox, TickReport, Tier, MAX_CONSECUTIVE_ROLLBACKS, MAX_OVERGRANT_ATTEMPTS_PER_EPOCH,
 };
-pub use payload::Target;
+pub use payload::{CanaryOutcome, Target};

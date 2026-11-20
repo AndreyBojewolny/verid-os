@@ -1,5 +1,7 @@
 //! Тесты Evolution Loop v0 (TASK-004): полный цикл, 5 красных линий,
 //! каскад деградации A->B->C, model_tier, детерминизм.
+//! TASK-008: checker по умолчанию MetricsSandbox; тестам, ожидающим
+//! исполнение, нужна нормальная база телеметрии (helper baseline).
 
 use std::sync::{Arc, Mutex};
 
@@ -17,7 +19,7 @@ fn mk(domain: u8) -> [u8; 32] {
 }
 
 fn config(budget: u64, cost: u64) -> Config {
-    Config { budget, execute_cost: cost, heartbeat_secs: 3600, actor: ACTOR }
+    Config { budget, execute_cost: cost, heartbeat_secs: 3600, actor: ACTOR, latency_tolerance_pct: 25 }
 }
 
 fn telemetry(journal: &mut Journal, metric: &str, value: i64, anomaly: bool) -> u64 {
@@ -26,6 +28,12 @@ fn telemetry(journal: &mut Journal, metric: &str, value: i64, anomaly: bool) -> 
         TaintFlags::empty(), Vec::new(), payload::telemetry(metric, value, anomaly),
     );
     journal.append(rec, &mk(0)).expect("telemetry append")
+}
+
+/// Нормальная база для checker'а: latency=200, errors=0 (аномалий нет).
+fn baseline(journal: &mut Journal) {
+    telemetry(journal, "latency", 200, false);
+    telemetry(journal, "errors", 0, false);
 }
 
 fn update(target: Target, caps_add: &[&str], canary_pass: bool) -> ProposedUpdate {
@@ -69,7 +77,7 @@ fn full_cycle_on_synthetic_telemetry() {
     let mut journal = Journal::new();
     let mut lp = EvolutionLoop::new(config(100, 10));
     telemetry(&mut journal, "latency", 500, true);
-    telemetry(&mut journal, "latency", 10, false); // нормальная — не триггер
+    baseline(&mut journal); // нормальные latency/errors — база checker, не триггеры
 
     let report = lp.tick(&mut journal, &ROOT, EPOCH, 1000, None).expect("tick");
     assert_eq!(report.triggers, 1);
@@ -90,6 +98,7 @@ fn full_cycle_on_synthetic_telemetry() {
 fn task_end_is_trigger() {
     let mut journal = Journal::new();
     let mut lp = EvolutionLoop::new(config(100, 10));
+    baseline(&mut journal);
     let rec = Record::draft(
         EPOCH, 16, 0, 5, EventKind::TaskEnd, TaintFlags::empty(), Vec::new(), Vec::new(),
     );
@@ -187,7 +196,8 @@ fn red_line_4_three_consecutive_rollbacks_pause() {
     let sink = CollectSink::default();
     lp.set_sink(Box::new(sink.clone()));
     for _ in 0..3 {
-        lp.submit(update(Target::Cell, &[], false), Vec::new()); // canary fail
+        // Базы телеметрии нет -> checker fail-closed откатывает каждое.
+        lp.submit(update(Target::Cell, &[], false), Vec::new());
     }
     let report = lp.tick(&mut journal, &ROOT, EPOCH, 1000, None).expect("tick");
     assert_eq!(report.rolled_back, 3);
@@ -202,11 +212,20 @@ fn red_line_4_three_consecutive_rollbacks_pause() {
 fn successful_canary_resets_rollback_counter() {
     let mut journal = Journal::new();
     let mut lp = EvolutionLoop::new(config(100, 10));
-    lp.submit(update(Target::Cell, &[], false), Vec::new());
-    lp.submit(update(Target::Cell, &[], false), Vec::new());
+    // Human-grant на добавляемое право: гейт пропустит, но checker откатит
+    // (errors_canary = 1 > базы 0). Обновление без изменений проходит.
+    let grant = Record::draft(
+        EPOCH, 0, journal.len() as u64, ACTOR, EventKind::CapGrant,
+        TaintFlags::empty(), Vec::new(),
+        veridos_journal::reachability::encode_cap("x.cap"),
+    );
+    journal.append(grant, &mk(0)).expect("human grant");
+    baseline(&mut journal);
+    lp.submit(update(Target::Cell, &["x.cap"], false), Vec::new());
+    lp.submit(update(Target::Cell, &["x.cap"], false), Vec::new());
     lp.submit(update(Target::Cell, &[], true), Vec::new()); // сброс счётчика
-    lp.submit(update(Target::Cell, &[], false), Vec::new());
-    lp.submit(update(Target::Cell, &[], false), Vec::new());
+    lp.submit(update(Target::Cell, &["x.cap"], false), Vec::new());
+    lp.submit(update(Target::Cell, &["x.cap"], false), Vec::new());
     let report = lp.tick(&mut journal, &ROOT, EPOCH, 1000, None).expect("tick");
     assert_eq!(report.status, LoopStatus::Running);
     assert_eq!(report.rolled_back, 4);
@@ -221,6 +240,7 @@ fn red_line_5_budget_cascade_a_b_c_with_heartbeat() {
     lp.set_sink(Box::new(sink.clone()));
 
     // Тик 1: исполнение съедает бюджет -> A->B.
+    baseline(&mut journal);
     telemetry(&mut journal, "latency", 500, true);
     let report = lp.tick(&mut journal, &ROOT, EPOCH, 1000, None).expect("tick1");
     assert_eq!(report.executed, 1);
@@ -275,6 +295,7 @@ fn owner_resume_after_stop() {
 fn every_decision_record_carries_model_tier() {
     let mut journal = Journal::new();
     let mut lp = EvolutionLoop::new(config(10, 10));
+    baseline(&mut journal);
     telemetry(&mut journal, "latency", 500, true);
     lp.tick(&mut journal, &ROOT, EPOCH, 1000, None).expect("tick");
     lp.tick(&mut journal, &ROOT, EPOCH, 2000, None).expect("tick");
@@ -315,6 +336,7 @@ fn applied_update_extends_capabilities_within_gate() {
         veridos_journal::reachability::encode_cap("fs.read"),
     );
     journal.append(grant, &mk(0)).expect("human grant");
+    baseline(&mut journal);
 
     let mut upd = update(Target::Cell, &[], true);
     upd.caps_del = vec!["fs.read".to_string()];
@@ -380,8 +402,9 @@ fn submitted_proposal_lineage_inherits_taint_to_applied_caps() {
         veridos_journal::reachability::encode_cap("fs.read"),
     );
     journal.append(grant, &mk(0)).expect("human grant");
+    baseline(&mut journal);
     let trigger = Record::draft(
-        EPOCH, 0, 1, 900, EventKind::McpResponse,
+        EPOCH, 0, journal.len() as u64, 900, EventKind::McpResponse,
         TaintFlags::EXTERNAL_NET | TaintFlags::UNVALIDATED, Vec::new(), Vec::new(),
     );
     let trigger_seq = journal.append(trigger, &mk(0)).expect("tainted trigger");

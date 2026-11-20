@@ -18,7 +18,7 @@ use crate::journal::{mac, AppendError, EventKind, Journal, Record, TaintFlags, W
 use crate::reachability::{gate_code_update, CapabilityGraph, GateVerdict};
 use crate::reachability::graph::encode_cap;
 
-use super::payload::{self, Target};
+use super::payload::{self, CanaryOutcome, Target};
 
 /// Порог красной линии 3: попыток расширения прав за эпоху до полной остановки.
 pub const MAX_OVERGRANT_ATTEMPTS_PER_EPOCH: u32 = 3;
@@ -59,6 +59,9 @@ pub struct Config {
     pub heartbeat_secs: u64,
     /// Актор петли в журнале.
     pub actor: u64,
+    /// Допуск non-regression по латентности, проценты к базе (TASK-008).
+    /// Канарейка проходит при latency_canary <= latency_base + pct%.
+    pub latency_tolerance_pct: u64,
 }
 
 /// Предложение генератора (Plan). v0: правила или внешняя очередь.
@@ -67,22 +70,169 @@ pub struct ProposedUpdate {
     pub target: Target,
     pub caps_add: Vec<String>,
     pub caps_del: Vec<String>,
-    /// Вход заглушки песочницы: детерминированный исход canary.
+    /// Вход тестовой заглушки RulesSandbox: самооценка генератора.
+    /// Продакшен-checker (MetricsSandbox) это поле не читает.
     pub canary_pass: bool,
 }
 
-/// Песочница Execute (заглушка v0). Реализация не должна паниковать.
-pub trait Sandbox {
-    /// true = canary прошёл, false = регресс (откат).
-    fn evaluate(&mut self, update: &ProposedUpdate) -> bool;
+/// Контекст канарейки для песочницы (TASK-008). Ключ — только параметр:
+/// песочница не хранит ключи и не выводит их сама.
+pub struct CanaryCtx<'a> {
+    /// Журнал: сюда пишутся канареечные Telemetry и отсюда читается база.
+    pub journal: &'a mut Journal,
+    /// Эпоха записей.
+    pub epoch: u32,
+    /// Доменный ключ L0 для записи канареечной телеметрии.
+    pub mac_key: &'a [u8; 32],
+    /// Актор канареечных записей.
+    pub actor: u64,
+    /// Seq записи CodeUpdate, уже присутствующей в журнале.
+    pub update_seq: u64,
 }
 
-/// Заглушка по умолчанию: исход задаётся предложением детерминированно.
+/// Песочница Execute. Реализация не должна паниковать. Вердикт определяет
+/// проверяющий (checker): самооценка генератора (update.canary_pass)
+/// продакшен-реализациями не читается.
+pub trait Sandbox {
+    /// Провести канарейку и вернуть вердикт со значениями. Ошибка записи
+    /// в журнал пробрасывается вызывающему (тик без побочных эффектов).
+    fn evaluate(
+        &mut self,
+        update: &ProposedUpdate,
+        ctx: &mut CanaryCtx<'_>,
+    ) -> Result<CanaryOutcome, AppendError>;
+}
+
+/// Тестовая заглушка: исход задаётся предложением (самооценка генератора).
+/// ЗАПРЕЩЕНА для продакшен-интеграции: подключается только явно через
+/// set_sandbox в тестах механики петли; по умолчанию используется
+/// MetricsSandbox.
 pub struct RulesSandbox;
 
 impl Sandbox for RulesSandbox {
-    fn evaluate(&mut self, update: &ProposedUpdate) -> bool {
-        update.canary_pass
+    fn evaluate(
+        &mut self,
+        update: &ProposedUpdate,
+        _ctx: &mut CanaryCtx<'_>,
+    ) -> Result<CanaryOutcome, AppendError> {
+        Ok(CanaryOutcome {
+            passed: update.canary_pass,
+            reason: "self-reported",
+            latency_base: None,
+            latency_canary: None,
+            errors_base: None,
+            errors_canary: None,
+        })
+    }
+}
+
+/// Базовая стоимость симулированного канареечного прогона (условные единицы).
+const CANARY_BASE_LATENCY: i64 = 100;
+/// Стоимость каждого изменения capability в симулированном прогоне.
+const CANARY_CHANGE_LATENCY: i64 = 25;
+
+/// Независимый проверяющий (checker, TASK-008): детерминированный
+/// симулированный канареечный прогон + сравнение с базой из журнала.
+/// Не читает update.canary_pass. Правила v0 (заменяются реальным
+/// исполнением на этапе B+): latency = 100 + 25 за каждое изменение
+/// capability; errors = число добавляемых capability. База — последняя
+/// нормальная фоновая Telemetry до update_seq (канареечные записи прогона
+/// базой не являются). Fail-closed: нет базы по метрике, tainted-база или
+/// арифметическое переполнение -> провал канарейки.
+pub struct MetricsSandbox {
+    latency_tolerance_pct: u64,
+}
+
+impl MetricsSandbox {
+    /// Checker с допуском латентности в процентах к базе (задаёт владелец).
+    pub fn new(latency_tolerance_pct: u64) -> Self {
+        Self { latency_tolerance_pct }
+    }
+
+    fn baseline(
+        journal: &Journal,
+        update_seq: u64,
+        metric: &str,
+    ) -> Option<(i64, bool)> {
+        let mut found = None;
+        for rec in journal.iter() {
+            if rec.seq >= update_seq || rec.kind != EventKind::Telemetry {
+                continue;
+            }
+            if let Some((m, value, anomaly, canary)) = payload::telemetry_metric(&rec.payload) {
+                if m == metric && !anomaly && !canary {
+                    found = Some((value, !rec.taint.is_empty()));
+                }
+            }
+        }
+        found
+    }
+}
+
+impl Sandbox for MetricsSandbox {
+    fn evaluate(
+        &mut self,
+        update: &ProposedUpdate,
+        ctx: &mut CanaryCtx<'_>,
+    ) -> Result<CanaryOutcome, AppendError> {
+        let changes = (update.caps_add.len() + update.caps_del.len()) as i64;
+        let latency_canary = CANARY_BASE_LATENCY + CANARY_CHANGE_LATENCY * changes;
+        let errors_canary = update.caps_add.len() as i64;
+
+        // Симулированный прогон журналируется: канареечные Telemetry
+        // наследуют родословную обновления (causality = [update_seq]).
+        for (metric, value) in [("latency", latency_canary), ("errors", errors_canary)] {
+            let rec = Record::draft(
+                ctx.epoch,
+                0,
+                ctx.journal.len() as u64,
+                ctx.actor,
+                EventKind::Telemetry,
+                TaintFlags::empty(),
+                alloc::vec![ctx.update_seq],
+                payload::canary_telemetry(metric, value),
+            );
+            ctx.journal.append(rec, ctx.mac_key)?;
+        }
+
+        let latency_base = Self::baseline(ctx.journal, ctx.update_seq, "latency");
+        let errors_base = Self::baseline(ctx.journal, ctx.update_seq, "errors");
+        let mut outcome = CanaryOutcome {
+            passed: false,
+            reason: "no-baseline",
+            latency_base: latency_base.map(|(v, _)| v),
+            latency_canary: Some(latency_canary),
+            errors_base: errors_base.map(|(v, _)| v),
+            errors_canary: Some(errors_canary),
+        };
+        let (Some((lat_base, lat_tainted)), Some((err_base, err_tainted))) =
+            (latency_base, errors_base)
+        else {
+            return Ok(outcome);
+        };
+        if lat_tainted || err_tainted {
+            outcome.reason = "tainted-evidence";
+            return Ok(outcome);
+        }
+        let threshold = (|| {
+            let allowance = lat_base.checked_mul(self.latency_tolerance_pct as i64)? / 100;
+            lat_base.checked_add(allowance)
+        })();
+        let Some(threshold) = threshold else {
+            outcome.reason = "invalid-baseline";
+            return Ok(outcome);
+        };
+        if latency_canary > threshold {
+            outcome.reason = "latency-regression";
+            return Ok(outcome);
+        }
+        if errors_canary > err_base {
+            outcome.reason = "errors-regression";
+            return Ok(outcome);
+        }
+        outcome.passed = true;
+        outcome.reason = "non-regression";
+        Ok(outcome)
     }
 }
 
@@ -116,7 +266,8 @@ pub struct EvolutionLoop {
 }
 
 impl EvolutionLoop {
-    /// Новая петля: ярус A, Running, полный бюджет, песочница-заглушка.
+    /// Новая петля: ярус A, Running, полный бюджет, checker MetricsSandbox
+    /// с допуском из Config (независимая оценка, не самооценка генератора).
     pub fn new(config: Config) -> Self {
         Self {
             config,
@@ -129,7 +280,7 @@ impl EvolutionLoop {
             last_heartbeat: 0,
             queue: Vec::new(),
             hypothesis_queue: Vec::new(),
-            sandbox: Box::new(RulesSandbox),
+            sandbox: Box::new(MetricsSandbox::new(config.latency_tolerance_pct)),
             sink: None,
         }
     }
@@ -139,7 +290,8 @@ impl EvolutionLoop {
         self.sink = Some(sink);
     }
 
-    /// Инъекция песочницы (замена заглушки).
+    /// Инъекция песочницы (замена checker'а по умолчанию). RulesSandbox —
+    /// только для тестов механики петли, не для продакшен-интеграции.
     pub fn set_sandbox(&mut self, sandbox: Box<dyn Sandbox>) {
         self.sandbox = sandbox;
     }
@@ -424,20 +576,27 @@ impl EvolutionLoop {
             return self.count_attempt(journal, epoch, key0);
         }
 
-        // Песочница (заглушка) + canary.
-        let passed = self.sandbox.evaluate(update);
+        // Песочница: независимый checker (симулированный прогон + база).
+        let mut canary_ctx = CanaryCtx {
+            journal,
+            epoch,
+            mac_key: key0,
+            actor: self.config.actor,
+            update_seq,
+        };
+        let outcome = self.sandbox.evaluate(update, &mut canary_ctx)?;
         self.append(
             journal,
             epoch,
             key0,
             EventKind::CanaryResult,
-            payload::canary_result(passed, update_seq),
+            payload::canary_result(&outcome, update_seq),
             alloc::vec![update_seq],
         )?;
-        if !passed {
+        if !outcome.passed {
             // Автооткат: изменения не применяются.
-            self.cycle(journal, epoch, key0, "rollback", "canary regression")?;
-            self.alert("canary regression, update rolled back");
+            self.cycle(journal, epoch, key0, "rollback", &format!("canary regression: {}", outcome.reason))?;
+            self.alert(&format!("canary regression ({}), update rolled back", outcome.reason));
             report.rolled_back += 1;
             self.consecutive_rollbacks += 1;
             // Красная линия 4: три подряд отката — пауза до человека.
