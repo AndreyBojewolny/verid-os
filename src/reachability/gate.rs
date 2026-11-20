@@ -29,8 +29,10 @@ pub enum GateVerdict {
 
 /// Проверка CodeUpdate на «не расширяет overgrant».
 /// before — граф до обновления, after — граф после (симуляция).
+/// update_seq — seq записи CodeUpdate, уже присутствующей в журнале.
 /// Гарантирует: расширение без human-grant (CapGrant домена 0 в after)
-/// всегда отклоняется и журналируется как DlqEntry (taint DLQ, домен 0);
+/// всегда отклоняется и журналируется как DlqEntry (taint DLQ, домен 0,
+/// causality = [update_seq] — наследует родословную и taint обновления);
 /// malformed capability-события в любом из графов отклоняются fail-closed;
 /// ослабление и отсутствие изменений без malformed проходят без записей
 /// в журнал; вердикт детерминирован по содержимому графов. Ключ — только
@@ -40,6 +42,7 @@ pub fn gate_code_update(
     mac_key: &[u8; 32],
     epoch: u32,
     update_actor: u64,
+    update_seq: u64,
     before: &CapabilityGraph,
     after: &CapabilityGraph,
 ) -> Result<GateVerdict, AppendError> {
@@ -81,7 +84,7 @@ pub fn gate_code_update(
         update_actor,
         EventKind::DlqEntry,
         TaintFlags::DLQ,
-        Vec::new(),
+        alloc::vec![update_seq],
         encode_cap(&format!("overgrant rejected: {summary}")),
     );
     let dlq_seq = journal.append(dlq, mac_key)?;

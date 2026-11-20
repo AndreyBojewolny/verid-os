@@ -132,3 +132,22 @@ fn unknown_parent_second_item_first_applies_and_chain_stays_valid() {
     assert_eq!(journal.iter().filter(|rec| rec.kind == EventKind::CanaryResult).count(), 1);
     journal.verify_chain(0..journal.len() as u64, &ROOT).expect("chain valid");
 }
+
+#[test]
+fn dlq_inherits_lineage_taint_end_to_end() {
+    let mut journal = Journal::new();
+    let t = tainted_trigger(&mut journal, 0, TaintFlags::EXTERNAL_NET | TaintFlags::UNVALIDATED);
+    let mut lp = EvolutionLoop::new(config());
+    let mut proposal = cell_update(true);
+    proposal.caps_add = vec!["key.sign".to_string()];
+    lp.submit(proposal, vec![t]);
+    let r = lp.tick(&mut journal, &ROOT, EPOCH, 1000, None).expect("tick");
+    assert_eq!(r.rejected, 1);
+    let upd = journal.iter().find(|rec| rec.kind == EventKind::CodeUpdate).expect("update");
+    let dlq = journal.iter().find(|rec| rec.kind == EventKind::DlqEntry).expect("dlq");
+    assert_eq!(dlq.causality, vec![upd.seq]);
+    assert!(dlq.taint.contains(TaintFlags::DLQ));
+    assert!(dlq.taint.contains(TaintFlags::EXTERNAL_NET));
+    assert!(dlq.taint.contains(TaintFlags::UNVALIDATED));
+    journal.verify_chain(0..journal.len() as u64, &ROOT).expect("chain valid");
+}

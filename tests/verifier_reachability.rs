@@ -68,13 +68,15 @@ fn partial_human_coverage_rejects_only_unauthorized() {
     grant(&mut after_j, 16, 1, "cap.b"); // без human-grant
     let after = CapabilityGraph::from_journal(&after_j);
 
-    let verdict = gate_code_update(&mut journal, &key(0), EPOCH, 1, &before, &after).expect("gate");
+    let update_seq = append(&mut journal, 16, 1, EventKind::CodeUpdate, encode_cap("update"));
+    let verdict = gate_code_update(&mut journal, &key(0), EPOCH, 1, update_seq, &before, &after).expect("gate");
     match verdict {
         GateVerdict::Reject { added, dlq_seq, .. } => {
             assert_eq!(added, vec![(1, "cap.b".into())]);
             let dlq = journal.get(dlq_seq).expect("dlq");
             assert_eq!(dlq.kind, EventKind::DlqEntry);
             assert!(dlq.taint.contains(TaintFlags::DLQ));
+            assert_eq!(dlq.causality, vec![update_seq]);
         }
         GateVerdict::Allow => panic!("partial coverage must reject unauthorized part"),
     }
@@ -92,9 +94,10 @@ fn repeated_grant_is_idempotent_for_gate() {
     let after = CapabilityGraph::from_journal(&after_j);
 
     assert!(!overgrant_diff(&before, &after).expanded);
+    let update_seq = append(&mut journal, 16, 1, EventKind::CodeUpdate, encode_cap("update"));
     let len = journal.len();
     assert_eq!(
-        gate_code_update(&mut journal, &key(0), EPOCH, 1, &before, &after).expect("gate"),
+        gate_code_update(&mut journal, &key(0), EPOCH, 1, update_seq, &before, &after).expect("gate"),
         GateVerdict::Allow
     );
     assert_eq!(journal.len(), len);
@@ -124,7 +127,8 @@ fn replay_preserves_state_and_graph() {
     grant(&mut after_j, 16, 1, "fs.read");
     grant(&mut after_j, 16, 1, "key.sign");
     let after = CapabilityGraph::from_journal(&after_j);
-    gate_code_update(&mut journal, &key(0), EPOCH, 1, &before, &after).expect("gate");
+    let update_seq = append(&mut journal, 16, 1, EventKind::CodeUpdate, encode_cap("update"));
+    gate_code_update(&mut journal, &key(0), EPOCH, 1, update_seq, &before, &after).expect("gate");
 
     let hash_before = journal.state_hash();
     let graph_before = CapabilityGraph::from_journal(&journal);
@@ -156,7 +160,8 @@ fn dlq_taint_inherited_by_child() {
     let mut after_j = Journal::new();
     grant(&mut after_j, 16, 1, "key.sign");
     let after = CapabilityGraph::from_journal(&after_j);
-    let dlq_seq = match gate_code_update(&mut journal, &key(0), EPOCH, 1, &before, &after).expect("gate") {
+    let update_seq = append(&mut journal, 16, 1, EventKind::CodeUpdate, encode_cap("update"));
+    let dlq_seq = match gate_code_update(&mut journal, &key(0), EPOCH, 1, update_seq, &before, &after).expect("gate") {
         GateVerdict::Reject { dlq_seq, .. } => dlq_seq,
         GateVerdict::Allow => panic!("must reject"),
     };
@@ -234,7 +239,8 @@ fn non_canonical_human_grant_does_not_authorize() {
     let bad_seq = append(&mut after_j, 0, 1, EventKind::CapGrant, long_form);
     let after = CapabilityGraph::from_journal(&after_j);
 
-    let verdict = gate_code_update(&mut journal, &key(0), EPOCH, 1, &before, &after).expect("gate");
+    let update_seq = append(&mut journal, 16, 1, EventKind::CodeUpdate, encode_cap("update"));
+    let verdict = gate_code_update(&mut journal, &key(0), EPOCH, 1, update_seq, &before, &after).expect("gate");
     match verdict {
         GateVerdict::Reject { malformed, dlq_seq, .. } => {
             assert_eq!(malformed, vec![bad_seq]);

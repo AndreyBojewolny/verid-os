@@ -417,7 +417,7 @@ impl EvolutionLoop {
             )?;
         }
         let after = CapabilityGraph::from_journal(&sim);
-        if let GateVerdict::Reject { .. } = gate_code_update(journal, key0, epoch, self.config.actor, &before, &after)? {
+        if let GateVerdict::Reject { .. } = gate_code_update(journal, key0, epoch, self.config.actor, update_seq, &before, &after)? {
             self.cycle(journal, epoch, key0, "rollback", "overgrant rejected by reachability gate")?;
             self.alert("RED LINE 3: overgrant attempt, rolled back, DLQ written");
             report.rejected += 1;
