@@ -4,7 +4,7 @@
 //! мутация байта, наследование DLQ-taint, семантика окна surface.
 
 use veridos_journal::journal::cas::Cas;
-use veridos_journal::journal::{mac, EventKind, Journal, Record, TaintFlags, VerifyError};
+use veridos_journal::journal::{mac, AppendError, EventKind, Journal, Record, TaintFlags, VerifyError};
 use veridos_journal::reachability::{
     gate_code_update, overgrant_diff, overgrant_surface, CapabilityGraph, GateVerdict,
 };
@@ -178,6 +178,49 @@ fn dlq_taint_inherited_by_child() {
     );
     let child_seq = journal.append(child, &key(16)).expect("child");
     assert!(journal.get(child_seq).expect("child").taint.contains(TaintFlags::DLQ));
+}
+
+#[test]
+fn dlq_inherits_tainted_update_at_gate_level() {
+    let mut journal = Journal::new();
+    grant(&mut journal, 16, 1, "fs.read");
+    let upd = Record::draft(
+        EPOCH, 16, journal.len() as u64, 1, EventKind::CodeUpdate,
+        TaintFlags::EXTERNAL_NET, Vec::new(), encode_cap("update"),
+    );
+    let update_seq = journal.append(upd, &key(16)).expect("tainted update");
+    let before = CapabilityGraph::from_journal(&journal);
+    let mut after_j = Journal::new();
+    grant(&mut after_j, 16, 1, "fs.read");
+    grant(&mut after_j, 16, 1, "key.sign");
+    let after = CapabilityGraph::from_journal(&after_j);
+
+    let dlq_seq = match gate_code_update(&mut journal, &key(0), EPOCH, 1, update_seq, &before, &after).expect("gate") {
+        GateVerdict::Reject { dlq_seq, .. } => dlq_seq,
+        GateVerdict::Allow => panic!("overgrant must reject"),
+    };
+    let dlq = journal.get(dlq_seq).expect("dlq");
+    assert_eq!(dlq.causality, vec![update_seq]);
+    assert!(dlq.taint.contains(TaintFlags::DLQ));
+    assert!(dlq.taint.contains(TaintFlags::EXTERNAL_NET));
+    journal.verify_chain(0..journal.len() as u64, &ROOT).expect("chain valid");
+}
+
+#[test]
+fn gate_unknown_update_seq_fails_without_dlq() {
+    let mut journal = Journal::new();
+    grant(&mut journal, 16, 1, "fs.read");
+    let before = CapabilityGraph::from_journal(&journal);
+    let mut after_j = Journal::new();
+    grant(&mut after_j, 16, 1, "fs.read");
+    grant(&mut after_j, 16, 1, "key.sign");
+    let after = CapabilityGraph::from_journal(&after_j);
+    let len = journal.len();
+    let hash = journal.state_hash();
+    let result = gate_code_update(&mut journal, &key(0), EPOCH, 1, 999, &before, &after);
+    assert_eq!(result, Err(AppendError::UnknownParent(999)));
+    assert_eq!(journal.len(), len, "DLQ не записан при неизвестном update_seq");
+    assert_eq!(journal.state_hash(), hash);
 }
 
 #[test]
