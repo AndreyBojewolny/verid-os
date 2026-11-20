@@ -144,9 +144,13 @@ impl EvolutionLoop {
         self.sandbox = sandbox;
     }
 
-    /// Очередь предложений генератора. Гарантирует: порядок FIFO.
-    pub fn submit(&mut self, update: ProposedUpdate) {
-        self.queue.push((update, Vec::new()));
+    /// Очередь предложений генератора. Гарантирует: порядок FIFO; causality —
+    /// родословная предложения (seq записей-триггеров), наследуется журналом
+    /// по OR при записи CodeUpdate и далее по цепочке; пустая родословная
+    /// допустима и означает отсутствие заявленных триггеров (ответственность
+    /// генератора); неизвестный родитель отклоняется журналом при исполнении.
+    pub fn submit(&mut self, update: ProposedUpdate, causality: Vec<u64>) {
+        self.queue.push((update, causality));
     }
 
     /// Текущий ярус деградации.

@@ -1,0 +1,29 @@
+TASK-007: causality в submit() — родословная внешних предложений
+
+## Цель
+Закрыть остаток Major-2 аудита TASK-004: внешне поданные предложения генератора
+получают родословную (causality) и наследуют taint триггеров через журнал.
+Предпосылка интеграции генератора (этап B).
+
+## Вход
+- master (v0.3.1)
+- reports/auditor-report-evolution-loop-recheck.md (остаток Major-2)
+- reports/verifier-evolution-loop-retry.md (наблюдение о submit)
+
+## Требования
+1. `EvolutionLoop::submit(update, causality: Vec<u64>)` — родословная передаётся
+   в очередь и используется при записи CodeUpdate; CanaryResult и применённые
+   CapGrant/CapRevoke наследуют её через update_seq (механика журнала, OR).
+2. Пустая causality допустима (политика обязательности — решение владельца
+   при интеграции генератора); неизвестный родитель отклоняется журналом
+   (UnknownParent) до мутации, ошибка тика без побочных эффектов на записи.
+3. Авто-путь петли (Monitor->Analyze->Plan) не меняется.
+4. Регрессионные тесты: tainted-родословная доходит до CodeUpdate/CanaryResult/
+   применённых caps; неизвестный родитель -> Err без изменения журнала.
+5. Все существующие вызовы submit обновлены; красные линии не ослаблены.
+
+## Зона файлов
+- src/loop/engine.rs, tests/evolution_loop_tests.rs, tests/verifier_evolution_loop.rs, tasks/
+
+## Формат сдачи
+- Ветка feature/submit-causality + отчёт reports/implementer-submit-causality.md
