@@ -309,3 +309,66 @@ fn three_fail_closed_rollbacks_pause_loop() {
     assert_eq!(r.status, LoopStatus::PausedHuman);
     journal.verify_chain(0..journal.len() as u64, &ROOT).expect("chain valid");
 }
+
+// --- Регрессия AUD-1: флаги anomaly/canary вне {0,1} невалидны (fail-closed). ---
+
+fn raw_telemetry(metric: &str, value: i64, anomaly: i64, canary: Option<i64>) -> Vec<u8> {
+    let mut entries = vec![
+        (Value::Text("metric".into()), Value::Text(metric.into())),
+        (Value::Text("value".into()), Value::Integer(value.into())),
+        (Value::Text("anomaly".into()), Value::Integer(anomaly.into())),
+    ];
+    if let Some(c) = canary {
+        entries.push((Value::Text("canary".into()), Value::Integer(c.into())));
+    }
+    let mut buf = Vec::new();
+    ciborium::ser::into_writer(&Value::Map(entries), &mut buf).expect("cbor");
+    buf
+}
+
+fn append_raw(journal: &mut Journal, payload_bytes: Vec<u8>) -> u64 {
+    let rec = Record::draft(
+        EPOCH, 0, journal.len() as u64, 900, EventKind::Telemetry,
+        TaintFlags::empty(), Vec::new(), payload_bytes,
+    );
+    journal.append(rec, &mk(0)).expect("raw telemetry")
+}
+
+#[test]
+fn anomaly_flag_outside_01_is_invalid() {
+    let mut journal = Journal::new();
+    // anomaly=2: не триггер и не база (даже с огромным значением).
+    append_raw(&mut journal, raw_telemetry("latency", 1_000_000, 2, None));
+    telemetry(&mut journal, "errors", 0, false, TaintFlags::empty());
+    let mut lp = EvolutionLoop::new(config(25));
+    lp.submit(update(&[], &[], true), Vec::new());
+    let r = lp.tick(&mut journal, &ROOT, EPOCH, 1000, None).expect("tick");
+    assert_eq!(r.triggers, 0);
+    assert_eq!(r.rolled_back, 1);
+    assert_eq!(field(&canary_of(&journal).payload, "reason"), Some(Value::Text("no-baseline".into())));
+}
+
+#[test]
+fn canary_flag_outside_01_is_invalid() {
+    let mut journal = Journal::new();
+    // canary=2: запись невалидна, фоновой базой не становится.
+    append_raw(&mut journal, raw_telemetry("latency", 200, 0, Some(2)));
+    telemetry(&mut journal, "errors", 0, false, TaintFlags::empty());
+    let mut lp = EvolutionLoop::new(config(25));
+    lp.submit(update(&[], &[], true), Vec::new());
+    let r = lp.tick(&mut journal, &ROOT, EPOCH, 1000, None).expect("tick");
+    assert_eq!(r.rolled_back, 1);
+    assert_eq!(field(&canary_of(&journal).payload, "reason"), Some(Value::Text("no-baseline".into())));
+}
+
+#[test]
+fn explicit_canary_zero_is_background() {
+    let mut journal = Journal::new();
+    // canary=0 — валидный фоновый маркер: база принимается.
+    append_raw(&mut journal, raw_telemetry("latency", 200, 0, Some(0)));
+    telemetry(&mut journal, "errors", 0, false, TaintFlags::empty());
+    let mut lp = EvolutionLoop::new(config(25));
+    lp.submit(update(&[], &[], true), Vec::new());
+    let r = lp.tick(&mut journal, &ROOT, EPOCH, 1000, None).expect("tick");
+    assert_eq!(r.executed, 1);
+}

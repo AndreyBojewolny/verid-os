@@ -77,8 +77,8 @@ pub fn canary_telemetry(metric: &str, value: i64) -> Vec<u8> {
 }
 
 /// Разбор Telemetry: Some((metric, value, anomaly, canary)) для валидного
-/// payload. Гарантирует: None для невалидного payload; canary — маркер
-/// канареечного прогона (отсутствует = фоновая телеметрия).
+/// payload. Гарантирует: None для невалидного payload и флагов вне {0,1}
+/// (fail-closed); canary отсутствует = фоновая телеметрия.
 pub fn telemetry_metric(payload: &[u8]) -> Option<(String, i64, bool, bool)> {
     let Value::Map(map) = ciborium::de::from_reader::<Value, _>(payload).ok()? else {
         return None;
@@ -88,6 +88,9 @@ pub fn telemetry_metric(payload: &[u8]) -> Option<(String, i64, bool, bool)> {
         Value::Integer(i) => i128::from(*i),
         _ => return None,
     };
+    if anomaly != 0 && anomaly != 1 {
+        return None;
+    }
     let metric = match get("metric")? {
         Value::Text(s) => s.clone(),
         _ => return None,
@@ -97,7 +100,11 @@ pub fn telemetry_metric(payload: &[u8]) -> Option<(String, i64, bool, bool)> {
         _ => return None,
     };
     let canary = match get("canary") {
-        Some(Value::Integer(i)) => i128::from(*i) == 1,
+        Some(Value::Integer(i)) => match i128::from(*i) {
+            0 => false,
+            1 => true,
+            _ => return None,
+        },
         Some(_) => return None,
         None => false,
     };
