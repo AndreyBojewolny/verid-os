@@ -42,6 +42,11 @@ fn tainted_trigger(journal: &mut Journal, source_seq: u64, taint: TaintFlags) ->
     journal.append(rec, &mk(0)).expect("trigger")
 }
 
+/// Чистый триггер-якорь для обязательной родословной submit (TASK-009).
+fn anchor(journal: &mut Journal) -> u64 {
+    tainted_trigger(journal, journal.len() as u64, TaintFlags::empty())
+}
+
 #[test]
 fn multi_parent_lineage_or_and_transitive_taint() {
     let mut journal = Journal::new();
@@ -57,7 +62,7 @@ fn multi_parent_lineage_or_and_transitive_taint() {
 
     let mut lp = EvolutionLoop::new(config());
     baseline(&mut journal);
-    lp.submit(cell_update(true), vec![p, clean]);
+    lp.submit(cell_update(true), vec![p, clean]).expect("submit");
     let r = lp.tick(&mut journal, &ROOT, EPOCH, 1000, None).expect("tick");
     assert_eq!(r.executed, 1);
     let upd = journal.iter().find(|rec| rec.kind == EventKind::CodeUpdate).expect("update");
@@ -73,7 +78,7 @@ fn rejected_overgrant_keeps_lineage_on_code_update() {
     let mut lp = EvolutionLoop::new(config());
     let mut proposal = cell_update(true);
     proposal.caps_add = vec!["key.sign".to_string()];
-    lp.submit(proposal, vec![t]);
+    lp.submit(proposal, vec![t]).expect("submit");
     let r = lp.tick(&mut journal, &ROOT, EPOCH, 1000, None).expect("tick");
     assert_eq!(r.rejected, 1);
     assert_eq!(r.status, LoopStatus::Running);
@@ -91,7 +96,7 @@ fn l0_attempt_with_lineage_still_freezes_before_record() {
     lp.submit(
         ProposedUpdate { target: Target::L0, caps_add: Vec::new(), caps_del: Vec::new(), canary_pass: true },
         vec![t],
-    );
+    ).expect("submit");
     let r = lp.tick(&mut journal, &ROOT, EPOCH, 1000, None).expect("tick");
     assert_eq!(r.status, LoopStatus::Frozen);
     assert!(!journal.iter().any(|rec| rec.kind == EventKind::CodeUpdate));
@@ -104,8 +109,8 @@ fn fifo_mixed_lineage_order_preserved() {
     let t2 = tainted_trigger(&mut journal, 1, TaintFlags::L2_UNTRUSTED);
     let mut lp = EvolutionLoop::new(config());
     baseline(&mut journal);
-    lp.submit(cell_update(true), vec![t1]);
-    lp.submit(cell_update(true), vec![t2]);
+    lp.submit(cell_update(true), vec![t1]).expect("submit");
+    lp.submit(cell_update(true), vec![t2]).expect("submit");
     let r = lp.tick(&mut journal, &ROOT, EPOCH, 1000, None).expect("tick");
     assert_eq!(r.executed, 2);
     let updates: Vec<&Record> = journal.iter().filter(|rec| rec.kind == EventKind::CodeUpdate).collect();
@@ -124,7 +129,7 @@ fn canary_failure_with_lineage_taints_canary_record() {
     let t = tainted_trigger(&mut journal, 0, TaintFlags::LLM_OUTPUT | TaintFlags::UNVALIDATED);
     let mut lp = EvolutionLoop::new(config());
     // Базы нет -> checker fail-closed откатывает; taint доходит до canary.
-    lp.submit(cell_update(false), vec![t]);
+    lp.submit(cell_update(false), vec![t]).expect("submit");
     let r = lp.tick(&mut journal, &ROOT, EPOCH, 1000, None).expect("tick");
     assert_eq!(r.rolled_back, 1);
     let upd = journal.iter().find(|rec| rec.kind == EventKind::CodeUpdate).expect("update");
@@ -139,8 +144,8 @@ fn unknown_parent_second_item_first_applies_and_chain_stays_valid() {
     let mut journal = Journal::new();
     let mut lp = EvolutionLoop::new(config());
     baseline(&mut journal);
-    lp.submit(cell_update(true), Vec::new());
-    lp.submit(cell_update(true), vec![999]);
+    lp.submit(cell_update(true), vec![anchor(&mut journal)]).expect("submit");
+    lp.submit(cell_update(true), vec![999]).expect("submit");
     let result = lp.tick(&mut journal, &ROOT, EPOCH, 1000, None);
     assert_eq!(result, Err(AppendError::UnknownParent(999)));
     // Первое предложение исполнено, второе отклонено до мутации; цепочка валидна.
@@ -156,7 +161,7 @@ fn dlq_inherits_lineage_taint_end_to_end() {
     let mut lp = EvolutionLoop::new(config());
     let mut proposal = cell_update(true);
     proposal.caps_add = vec!["key.sign".to_string()];
-    lp.submit(proposal, vec![t]);
+    lp.submit(proposal, vec![t]).expect("submit");
     let r = lp.tick(&mut journal, &ROOT, EPOCH, 1000, None).expect("tick");
     assert_eq!(r.rejected, 1);
     let upd = journal.iter().find(|rec| rec.kind == EventKind::CodeUpdate).expect("update");

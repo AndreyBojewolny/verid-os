@@ -36,6 +36,16 @@ fn baseline(journal: &mut Journal) {
     telemetry(journal, "errors", 0, false);
 }
 
+/// Чистый триггер-якорь для обязательной родословной submit (TASK-009).
+/// McpResponse не триггерит Monitor — счётчики тика не меняются.
+fn anchor(journal: &mut Journal) -> u64 {
+    let rec = Record::draft(
+        EPOCH, 0, journal.len() as u64, 900, EventKind::McpResponse,
+        TaintFlags::empty(), Vec::new(), Vec::new(),
+    );
+    journal.append(rec, &mk(0)).expect("anchor")
+}
+
 fn update(target: Target, caps_add: &[&str], canary_pass: bool) -> ProposedUpdate {
     ProposedUpdate {
         target,
@@ -114,7 +124,7 @@ fn red_line_1_l0_change_freezes() {
     let mut lp = EvolutionLoop::new(config(100, 10));
     let sink = CollectSink::default();
     lp.set_sink(Box::new(sink.clone()));
-    lp.submit(update(Target::L0, &[], true), Vec::new());
+    lp.submit(update(Target::L0, &[], true), vec![anchor(&mut journal)]).expect("submit");
 
     let report = lp.tick(&mut journal, &ROOT, EPOCH, 1000, None).expect("tick");
     assert_eq!(report.status, LoopStatus::Frozen);
@@ -122,7 +132,7 @@ fn red_line_1_l0_change_freezes() {
     assert!(sink.0.lock().unwrap().iter().any(|m| m.contains("RED LINE 1")));
 
     // Замороженная петля не исполняет даже разрешённые обновления.
-    lp.submit(update(Target::Cell, &[], true), Vec::new());
+    lp.submit(update(Target::Cell, &[], true), vec![anchor(&mut journal)]).expect("submit");
     let len = journal.len();
     lp.tick(&mut journal, &ROOT, EPOCH, 2000, None).expect("tick");
     assert_eq!(journal.len(), len);
@@ -135,7 +145,7 @@ fn red_line_2_state_hash_divergence_freezes_with_priority() {
     let sink = CollectSink::default();
     lp.set_sink(Box::new(sink.clone()));
     telemetry(&mut journal, "latency", 500, true);
-    lp.submit(update(Target::Cell, &[], true), Vec::new());
+    lp.submit(update(Target::Cell, &[], true), vec![anchor(&mut journal)]).expect("submit");
 
     let wrong_hash = [0xAAu8; 32];
     let report = lp.tick(&mut journal, &ROOT, EPOCH, 1000, Some(wrong_hash)).expect("tick");
@@ -161,7 +171,7 @@ fn red_line_3_overgrant_rollback_dlq_and_full_stop() {
     let sink = CollectSink::default();
     lp.set_sink(Box::new(sink.clone()));
     for _ in 0..3 {
-        lp.submit(update(Target::Cell, &["key.sign"], true), Vec::new());
+        lp.submit(update(Target::Cell, &["key.sign"], true), vec![anchor(&mut journal)]).expect("submit");
     }
 
     let report = lp.tick(&mut journal, &ROOT, EPOCH, 1000, None).expect("tick");
@@ -182,7 +192,7 @@ fn red_line_3_overgrant_rollback_dlq_and_full_stop() {
 fn red_line_3_loop_self_modification_is_violation() {
     let mut journal = Journal::new();
     let mut lp = EvolutionLoop::new(config(100, 10));
-    lp.submit(update(Target::Loop, &[], true), Vec::new());
+    lp.submit(update(Target::Loop, &[], true), vec![anchor(&mut journal)]).expect("submit");
     let report = lp.tick(&mut journal, &ROOT, EPOCH, 1000, None).expect("tick");
     assert_eq!(report.rejected, 1);
     assert_eq!(report.executed, 0);
@@ -197,7 +207,7 @@ fn red_line_4_three_consecutive_rollbacks_pause() {
     lp.set_sink(Box::new(sink.clone()));
     for _ in 0..3 {
         // Базы телеметрии нет -> checker fail-closed откатывает каждое.
-        lp.submit(update(Target::Cell, &[], false), Vec::new());
+        lp.submit(update(Target::Cell, &[], false), vec![anchor(&mut journal)]).expect("submit");
     }
     let report = lp.tick(&mut journal, &ROOT, EPOCH, 1000, None).expect("tick");
     assert_eq!(report.rolled_back, 3);
@@ -221,11 +231,11 @@ fn successful_canary_resets_rollback_counter() {
     );
     journal.append(grant, &mk(0)).expect("human grant");
     baseline(&mut journal);
-    lp.submit(update(Target::Cell, &["x.cap"], false), Vec::new());
-    lp.submit(update(Target::Cell, &["x.cap"], false), Vec::new());
-    lp.submit(update(Target::Cell, &[], true), Vec::new()); // сброс счётчика
-    lp.submit(update(Target::Cell, &["x.cap"], false), Vec::new());
-    lp.submit(update(Target::Cell, &["x.cap"], false), Vec::new());
+    lp.submit(update(Target::Cell, &["x.cap"], false), vec![anchor(&mut journal)]).expect("submit");
+    lp.submit(update(Target::Cell, &["x.cap"], false), vec![anchor(&mut journal)]).expect("submit");
+    lp.submit(update(Target::Cell, &[], true), vec![anchor(&mut journal)]).expect("submit"); // сброс счётчика
+    lp.submit(update(Target::Cell, &["x.cap"], false), vec![anchor(&mut journal)]).expect("submit");
+    lp.submit(update(Target::Cell, &["x.cap"], false), vec![anchor(&mut journal)]).expect("submit");
     let report = lp.tick(&mut journal, &ROOT, EPOCH, 1000, None).expect("tick");
     assert_eq!(report.status, LoopStatus::Running);
     assert_eq!(report.rolled_back, 4);
@@ -275,7 +285,7 @@ fn owner_resume_after_stop() {
     let mut journal = Journal::new();
     let mut lp = EvolutionLoop::new(config(100, 10));
     for _ in 0..3 {
-        lp.submit(update(Target::Cell, &["key.sign"], true), Vec::new());
+        lp.submit(update(Target::Cell, &["key.sign"], true), vec![anchor(&mut journal)]).expect("submit");
     }
     lp.tick(&mut journal, &ROOT, EPOCH, 1000, None).expect("tick");
     assert_eq!(lp.status(), LoopStatus::Stopped);
@@ -285,7 +295,7 @@ fn owner_resume_after_stop() {
     assert!(phases(&journal).contains(&"resume".to_string()));
 
     // После разбора одно отклонение не останавливает петлю (счётчик сброшен).
-    lp.submit(update(Target::Cell, &["key.sign"], true), Vec::new());
+    lp.submit(update(Target::Cell, &["key.sign"], true), vec![anchor(&mut journal)]).expect("submit");
     let report = lp.tick(&mut journal, &ROOT, EPOCH, 2000, None).expect("tick");
     assert_eq!(report.rejected, 1);
     assert_eq!(report.status, LoopStatus::Running);
@@ -318,7 +328,7 @@ fn deterministic_full_cycle() {
         let mut journal = Journal::new();
         let mut lp = EvolutionLoop::new(config(100, 10));
         telemetry(&mut journal, "latency", 500, true);
-        lp.submit(update(Target::Cell, &["fs.read"], true), Vec::new());
+        lp.submit(update(Target::Cell, &["fs.read"], true), vec![anchor(&mut journal)]).expect("submit");
         lp.tick(&mut journal, &ROOT, EPOCH, 1000, None).expect("tick");
         journal.state_hash()
     };
@@ -340,7 +350,7 @@ fn applied_update_extends_capabilities_within_gate() {
 
     let mut upd = update(Target::Cell, &[], true);
     upd.caps_del = vec!["fs.read".to_string()];
-    lp.submit(upd, Vec::new());
+    lp.submit(upd, vec![anchor(&mut journal)]).expect("submit");
     let report = lp.tick(&mut journal, &ROOT, EPOCH, 1000, None).expect("tick");
     assert_eq!(report.executed, 1);
     let graph = veridos_journal::reachability::CapabilityGraph::from_journal(&journal);
@@ -416,7 +426,7 @@ fn submitted_proposal_lineage_inherits_taint_to_applied_caps() {
         caps_del: vec!["fs.read".to_string()],
         canary_pass: true,
     };
-    lp.submit(proposal, vec![trigger_seq]);
+    lp.submit(proposal, vec![trigger_seq]).expect("submit");
     let report = lp.tick(&mut journal, &ROOT, EPOCH, 1000, None).expect("tick");
     assert_eq!(report.executed, 1);
 
@@ -439,7 +449,7 @@ fn submitted_proposal_unknown_parent_rejected_without_side_effects() {
     let mut journal = Journal::new();
     let hash_before = journal.state_hash();
     let mut lp = EvolutionLoop::new(config(100, 10));
-    lp.submit(update(Target::Cell, &[], true), vec![99]);
+    lp.submit(update(Target::Cell, &[], true), vec![99]).expect("submit");
     let result = lp.tick(&mut journal, &ROOT, EPOCH, 1000, None);
     assert_eq!(result, Err(AppendError::UnknownParent(99)));
     assert!(journal.is_empty());

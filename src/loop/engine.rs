@@ -75,17 +75,65 @@ pub struct ProposedUpdate {
     pub canary_pass: bool,
 }
 
-/// Контекст канарейки для песочницы (TASK-008). Ключ — только параметр:
-/// песочница не хранит ключи и не выводит их сама.
+/// Ошибка подачи предложения генератора (TASK-009).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SubmitError {
+    /// Родословная пуста: каждое решение обязано ссылаться на запись-триггер.
+    EmptyLineage,
+}
+
+/// Узкий доступ песочницы к журналу (TASK-009): запись ТОЛЬКО канареечной
+/// Telemetry симулированного прогона и чтение журнала. Произвольный append
+/// песочнице недоступен на уровне типов. Ключ — только параметр конструктора:
+/// handle не хранит ключи в статических структурах и не выводит их сам.
+pub struct CanaryJournal<'a> {
+    journal: &'a mut Journal,
+    epoch: u32,
+    mac_key: &'a [u8; 32],
+    actor: u64,
+    update_seq: u64,
+}
+
+impl<'a> CanaryJournal<'a> {
+    /// Handle канарейки для обновления update_seq. Гарантирует: все записи
+    /// через record_canary идут в домен 0 с пустым taint и causality=[update_seq].
+    pub fn new(
+        journal: &'a mut Journal,
+        epoch: u32,
+        mac_key: &'a [u8; 32],
+        actor: u64,
+        update_seq: u64,
+    ) -> Self {
+        Self { journal, epoch, mac_key, actor, update_seq }
+    }
+
+    /// Записать канареечную Telemetry прогона. Гарантирует: маркер canary=1
+    /// (запись не станет базой non-regression), causality=[update_seq],
+    /// домен 0, TaintFlags::empty(); возвращает seq записи.
+    pub fn record_canary(&mut self, metric: &str, value: i64) -> Result<u64, AppendError> {
+        let rec = Record::draft(
+            self.epoch,
+            0,
+            self.journal.len() as u64,
+            self.actor,
+            EventKind::Telemetry,
+            TaintFlags::empty(),
+            alloc::vec![self.update_seq],
+            payload::canary_telemetry(metric, value),
+        );
+        self.journal.append(rec, self.mac_key)
+    }
+
+    /// Чтение журнала (база non-regression и прочие свидетельства).
+    pub fn journal(&self) -> &Journal {
+        self.journal
+    }
+}
+
+/// Контекст канарейки для песочницы (TASK-008, сужен TASK-009).
 pub struct CanaryCtx<'a> {
-    /// Журнал: сюда пишутся канареечные Telemetry и отсюда читается база.
-    pub journal: &'a mut Journal,
-    /// Эпоха записей.
-    pub epoch: u32,
-    /// Доменный ключ L0 для записи канареечной телеметрии.
-    pub mac_key: &'a [u8; 32],
-    /// Актор канареечных записей.
-    pub actor: u64,
+    /// Узкий журнал: только канареечные записи прогона + чтение.
+    pub journal: CanaryJournal<'a>,
     /// Seq записи CodeUpdate, уже присутствующей в журнале.
     pub update_seq: u64,
 }
@@ -136,8 +184,10 @@ const CANARY_CHANGE_LATENCY: i64 = 25;
 /// Не читает update.canary_pass. Правила v0 (заменяются реальным
 /// исполнением на этапе B+): latency = 100 + 25 за каждое изменение
 /// capability; errors = число добавляемых capability. База — последняя
-/// нормальная фоновая Telemetry до update_seq (канареечные записи прогона
-/// базой не являются). Fail-closed: нет базы по метрике, tainted-база или
+/// нормальная фоновая Telemetry ДОМЕНА 0 (L0/монитор владельца) с пустым
+/// taint до update_seq (TASK-009): телеметрия клеток свидетельством не
+/// является, канареечные записи прогона базой не являются. Fail-closed:
+/// нет базы по метрике, tainted-база, недопустимый допуск или
 /// арифметическое переполнение -> провал канарейки.
 pub struct MetricsSandbox {
     latency_tolerance_pct: u64,
@@ -156,7 +206,7 @@ impl MetricsSandbox {
     ) -> Option<(i64, bool)> {
         let mut found = None;
         for rec in journal.iter() {
-            if rec.seq >= update_seq || rec.kind != EventKind::Telemetry {
+            if rec.seq >= update_seq || rec.kind != EventKind::Telemetry || rec.domain != 0 {
                 continue;
             }
             if let Some((m, value, anomaly, canary)) = payload::telemetry_metric(&rec.payload) {
@@ -179,24 +229,14 @@ impl Sandbox for MetricsSandbox {
         let latency_canary = CANARY_BASE_LATENCY + CANARY_CHANGE_LATENCY * changes;
         let errors_canary = update.caps_add.len() as i64;
 
-        // Симулированный прогон журналируется: канареечные Telemetry
-        // наследуют родословную обновления (causality = [update_seq]).
+        // Симулированный прогон журналируется через узкий handle:
+        // канареечные Telemetry наследуют родословную обновления.
         for (metric, value) in [("latency", latency_canary), ("errors", errors_canary)] {
-            let rec = Record::draft(
-                ctx.epoch,
-                0,
-                ctx.journal.len() as u64,
-                ctx.actor,
-                EventKind::Telemetry,
-                TaintFlags::empty(),
-                alloc::vec![ctx.update_seq],
-                payload::canary_telemetry(metric, value),
-            );
-            ctx.journal.append(rec, ctx.mac_key)?;
+            ctx.journal.record_canary(metric, value)?;
         }
 
-        let latency_base = Self::baseline(ctx.journal, ctx.update_seq, "latency");
-        let errors_base = Self::baseline(ctx.journal, ctx.update_seq, "errors");
+        let latency_base = Self::baseline(ctx.journal.journal(), ctx.update_seq, "latency");
+        let errors_base = Self::baseline(ctx.journal.journal(), ctx.update_seq, "errors");
         let mut outcome = CanaryOutcome {
             passed: false,
             reason: "no-baseline",
@@ -214,8 +254,12 @@ impl Sandbox for MetricsSandbox {
             outcome.reason = "tainted-evidence";
             return Ok(outcome);
         }
+        let Ok(pct) = i64::try_from(self.latency_tolerance_pct) else {
+            outcome.reason = "invalid-config";
+            return Ok(outcome);
+        };
         let threshold = (|| {
-            let allowance = lat_base.checked_mul(self.latency_tolerance_pct as i64)? / 100;
+            let allowance = lat_base.checked_mul(pct)? / 100;
             lat_base.checked_add(allowance)
         })();
         let Some(threshold) = threshold else {
@@ -297,12 +341,20 @@ impl EvolutionLoop {
     }
 
     /// Очередь предложений генератора. Гарантирует: порядок FIFO; causality —
-    /// родословная предложения (seq записей-триггеров), наследуется журналом
-    /// по OR при записи CodeUpdate и далее по цепочке; пустая родословная
-    /// допустима и означает отсутствие заявленных триггеров (ответственность
-    /// генератора); неизвестный родитель отклоняется журналом при исполнении.
-    pub fn submit(&mut self, update: ProposedUpdate, causality: Vec<u64>) {
+    /// непустая родословная предложения (seq записей-триггеров), наследуется
+    /// журналом по OR при записи CodeUpdate и далее по цепочке; пустая
+    /// родословная отклоняется немедленно (SubmitError::EmptyLineage) до
+    /// постановки в очередь и до мутации журнала (TASK-009); неизвестный
+    /// родитель отклоняется журналом при исполнении. Очередь сохраняется
+    /// во время паузы/заморозки/остановки и потребляется первым тиком после
+    /// owner_resume (предложения, поданные в не-Running состоянии, не
+    /// отбрасываются).
+    pub fn submit(&mut self, update: ProposedUpdate, causality: Vec<u64>) -> Result<(), SubmitError> {
+        if causality.is_empty() {
+            return Err(SubmitError::EmptyLineage);
+        }
         self.queue.push((update, causality));
+        Ok(())
     }
 
     /// Текущий ярус деградации.
@@ -577,11 +629,9 @@ impl EvolutionLoop {
         }
 
         // Песочница: независимый checker (симулированный прогон + база).
+        // Доступ к журналу сужен: только канареечные записи + чтение.
         let mut canary_ctx = CanaryCtx {
-            journal,
-            epoch,
-            mac_key: key0,
-            actor: self.config.actor,
+            journal: CanaryJournal::new(journal, epoch, key0, self.config.actor, update_seq),
             update_seq,
         };
         let outcome = self.sandbox.evaluate(update, &mut canary_ctx)?;
