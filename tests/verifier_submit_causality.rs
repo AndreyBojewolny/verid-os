@@ -16,7 +16,19 @@ fn mk(domain: u8) -> [u8; 32] {
 }
 
 fn config() -> Config {
-    Config { budget: 100, execute_cost: 10, heartbeat_secs: 60, actor: ACTOR }
+    Config { budget: 100, execute_cost: 10, heartbeat_secs: 60, actor: ACTOR, latency_tolerance_pct: 25 }
+}
+
+/// Нормальная база для checker'а TASK-008: latency=200, errors=0.
+fn baseline(journal: &mut Journal) {
+    for (metric, value) in [("latency", 200i64), ("errors", 0)] {
+        let rec = Record::draft(
+            EPOCH, 0, journal.len() as u64, 900, EventKind::Telemetry,
+            TaintFlags::empty(), Vec::new(),
+            veridos_journal::evolution_loop::payload::telemetry(metric, value, false),
+        );
+        journal.append(rec, &mk(0)).expect("baseline telemetry");
+    }
 }
 
 fn cell_update(canary_pass: bool) -> ProposedUpdate {
@@ -44,6 +56,7 @@ fn multi_parent_lineage_or_and_transitive_taint() {
         .expect("clean");
 
     let mut lp = EvolutionLoop::new(config());
+    baseline(&mut journal);
     lp.submit(cell_update(true), vec![p, clean]);
     let r = lp.tick(&mut journal, &ROOT, EPOCH, 1000, None).expect("tick");
     assert_eq!(r.executed, 1);
@@ -90,6 +103,7 @@ fn fifo_mixed_lineage_order_preserved() {
     let t1 = tainted_trigger(&mut journal, 0, TaintFlags::EXTERNAL_NET);
     let t2 = tainted_trigger(&mut journal, 1, TaintFlags::L2_UNTRUSTED);
     let mut lp = EvolutionLoop::new(config());
+    baseline(&mut journal);
     lp.submit(cell_update(true), vec![t1]);
     lp.submit(cell_update(true), vec![t2]);
     let r = lp.tick(&mut journal, &ROOT, EPOCH, 1000, None).expect("tick");
@@ -109,6 +123,7 @@ fn canary_failure_with_lineage_taints_canary_record() {
     let mut journal = Journal::new();
     let t = tainted_trigger(&mut journal, 0, TaintFlags::LLM_OUTPUT | TaintFlags::UNVALIDATED);
     let mut lp = EvolutionLoop::new(config());
+    // Базы нет -> checker fail-closed откатывает; taint доходит до canary.
     lp.submit(cell_update(false), vec![t]);
     let r = lp.tick(&mut journal, &ROOT, EPOCH, 1000, None).expect("tick");
     assert_eq!(r.rolled_back, 1);
@@ -123,6 +138,7 @@ fn canary_failure_with_lineage_taints_canary_record() {
 fn unknown_parent_second_item_first_applies_and_chain_stays_valid() {
     let mut journal = Journal::new();
     let mut lp = EvolutionLoop::new(config());
+    baseline(&mut journal);
     lp.submit(cell_update(true), Vec::new());
     lp.submit(cell_update(true), vec![999]);
     let result = lp.tick(&mut journal, &ROOT, EPOCH, 1000, None);

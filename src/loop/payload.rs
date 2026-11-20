@@ -64,9 +64,22 @@ pub fn telemetry(metric: &str, value: i64, anomaly: bool) -> Vec<u8> {
     ])
 }
 
-/// Разбор Telemetry: Some((metric, value)) только если anomaly == 1.
-/// Гарантирует: None для невалидного payload и нормальной телеметрии.
-pub fn telemetry_anomaly(payload: &[u8]) -> Option<(String, i64)> {
+/// Payload канареечной Telemetry (симулированный прогон checker'а).
+/// Маркер canary=1 отличает измерения прогона от фоновой телеметрии:
+/// база non-regression берётся только из фоновых записей.
+pub fn canary_telemetry(metric: &str, value: i64) -> Vec<u8> {
+    encode_map(alloc::vec![
+        text("metric", metric),
+        ("value".to_string(), Value::Integer(value.into())),
+        uint("anomaly", 0),
+        uint("canary", 1),
+    ])
+}
+
+/// Разбор Telemetry: Some((metric, value, anomaly, canary)) для валидного
+/// payload. Гарантирует: None для невалидного payload; canary — маркер
+/// канареечного прогона (отсутствует = фоновая телеметрия).
+pub fn telemetry_metric(payload: &[u8]) -> Option<(String, i64, bool, bool)> {
     let Value::Map(map) = ciborium::de::from_reader::<Value, _>(payload).ok()? else {
         return None;
     };
@@ -75,9 +88,6 @@ pub fn telemetry_anomaly(payload: &[u8]) -> Option<(String, i64)> {
         Value::Integer(i) => i128::from(*i),
         _ => return None,
     };
-    if anomaly != 1 {
-        return None;
-    }
     let metric = match get("metric")? {
         Value::Text(s) => s.clone(),
         _ => return None,
@@ -86,7 +96,23 @@ pub fn telemetry_anomaly(payload: &[u8]) -> Option<(String, i64)> {
         Value::Integer(i) => i64::try_from(i128::from(*i)).ok()?,
         _ => return None,
     };
-    Some((metric, value))
+    let canary = match get("canary") {
+        Some(Value::Integer(i)) => i128::from(*i) == 1,
+        Some(_) => return None,
+        None => false,
+    };
+    Some((metric, value, anomaly == 1, canary))
+}
+
+/// Разбор Telemetry: Some((metric, value)) только если anomaly == 1.
+/// Гарантирует: None для невалидного payload и нормальной телеметрии.
+pub fn telemetry_anomaly(payload: &[u8]) -> Option<(String, i64)> {
+    let (metric, value, anomaly, _canary) = telemetry_metric(payload)?;
+    if anomaly {
+        Some((metric, value))
+    } else {
+        None
+    }
 }
 
 /// Payload Hypothesis (решение Analyze). Гарантирует: model_tier присутствует.
@@ -104,12 +130,37 @@ pub fn code_update(target: Target, caps_add: &[String], caps_del: &[String]) -> 
     ])
 }
 
-/// Payload CanaryResult. Гарантирует: model_tier присутствует.
-pub fn canary_result(passed: bool, update_seq: u64) -> Vec<u8> {
+/// Исход канарейки: вердикт проверяющего и использованные значения.
+/// Значения None — свидетельству нет (fail-closed) либо заглушка не измеряет.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CanaryOutcome {
+    /// true = canary прошла (non-regression выполнен).
+    pub passed: bool,
+    /// Машинная причина вердикта (для журнала и алертов).
+    pub reason: &'static str,
+    /// Базовая латентность (последняя нормальная до update_seq).
+    pub latency_base: Option<i64>,
+    /// Канареечная латентность (симулированный прогон).
+    pub latency_canary: Option<i64>,
+    /// Базовые ошибки.
+    pub errors_base: Option<i64>,
+    /// Канареечные ошибки.
+    pub errors_canary: Option<i64>,
+}
+
+/// Payload CanaryResult. Гарантирует: model_tier присутствует, канонический
+/// CBOR, детерминирован бит-в-бит; отсутствующие значения кодируются null.
+pub fn canary_result(outcome: &CanaryOutcome, update_seq: u64) -> Vec<u8> {
+    let opt = |v: Option<i64>| v.map_or(Value::Null, |x| Value::Integer(x.into()));
     encode_map(alloc::vec![
-        uint("passed", u64::from(passed)),
+        uint("passed", u64::from(outcome.passed)),
         uint("update_seq", update_seq),
+        text("reason", outcome.reason),
         text("model_tier", MODEL_TIER_RULES),
+        ("latency_base".to_string(), opt(outcome.latency_base)),
+        ("latency_canary".to_string(), opt(outcome.latency_canary)),
+        ("errors_base".to_string(), opt(outcome.errors_base)),
+        ("errors_canary".to_string(), opt(outcome.errors_canary)),
     ])
 }
 

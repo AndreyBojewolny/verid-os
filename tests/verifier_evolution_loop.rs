@@ -17,7 +17,18 @@ fn mk(epoch: u32, domain: u8) -> [u8; 32] {
 }
 
 fn config(budget: u64, cost: u64) -> Config {
-    Config { budget, execute_cost: cost, heartbeat_secs: 60, actor: ACTOR }
+    Config { budget, execute_cost: cost, heartbeat_secs: 60, actor: ACTOR, latency_tolerance_pct: 25 }
+}
+
+/// Нормальная база для checker'а TASK-008: latency=200, errors=0.
+fn baseline(journal: &mut Journal, epoch: u32) {
+    for (metric, value) in [("latency", 200i64), ("errors", 0)] {
+        let rec = Record::draft(
+            epoch, 0, journal.len() as u64, 901, EventKind::Telemetry,
+            TaintFlags::empty(), Vec::new(), payload::telemetry(metric, value, false),
+        );
+        journal.append(rec, &mk(epoch, 0)).expect("baseline telemetry");
+    }
 }
 
 fn anomaly(journal: &mut Journal, epoch: u32) -> u64 {
@@ -101,7 +112,8 @@ fn canary_rollback_really_prevents_capability_change() {
     journal.append(grant, &mk(1, 0)).expect("human grant");
 
     let mut lp = EvolutionLoop::new(config(100, 10));
-    lp.submit(upd(Target::Cell, &[], &["fs.read"], false), Vec::new()); // отзыв, но canary fail
+    // Базы нет -> checker fail-closed: отзыв не применяется даже без canary_pass.
+    lp.submit(upd(Target::Cell, &[], &["fs.read"], false), Vec::new());
     let r = lp.tick(&mut journal, &ROOT, 1, 1000, None).expect("tick");
     assert_eq!(r.rolled_back, 1);
     assert_eq!(r.executed, 0);
@@ -116,7 +128,7 @@ fn rejected_updates_do_not_consume_budget() {
     let mut journal = Journal::new();
     let mut lp = EvolutionLoop::new(config(100, 10));
     lp.submit(upd(Target::Cell, &["key.sign"], &[], true), Vec::new()); // overgrant -> reject
-    lp.submit(upd(Target::Cell, &[], &[], false), Vec::new()); // canary fail -> rollback
+    lp.submit(upd(Target::Cell, &[], &[], false), Vec::new()); // нет базы -> fail-closed rollback
     let r = lp.tick(&mut journal, &ROOT, 1, 1000, None).expect("tick");
     assert_eq!(r.rejected, 1);
     assert_eq!(r.rolled_back, 1);
@@ -141,6 +153,7 @@ fn malformed_telemetry_is_not_a_trigger() {
 #[test]
 fn redelivered_telemetry_triggers_once() {
     let mut journal = Journal::new();
+    baseline(&mut journal, 1);
     let seq1 = anomaly(&mut journal, 1);
     // Повторная доставка того же события (тот же source_seq) — дедуп журнала.
     let rec = Record::draft(
@@ -160,6 +173,7 @@ fn redelivered_telemetry_triggers_once() {
 fn pause_blocks_until_owner_resume_and_resets_counter() {
     let mut journal = Journal::new();
     let mut lp = EvolutionLoop::new(config(100, 10));
+    // Базы нет -> checker fail-closed откатывает каждое из трёх.
     for _ in 0..3 {
         lp.submit(upd(Target::Cell, &[], &[], false), Vec::new());
     }
@@ -173,9 +187,21 @@ fn pause_blocks_until_owner_resume_and_resets_counter() {
     assert_eq!(journal.len(), len);
 
     lp.owner_resume(&mut journal, &ROOT, 1).expect("resume");
+    // Поданное во время паузы предложение всё ещё в очереди: первый тик
+    // после resume потребляет его. Даём базу — оно проходит и сбрасывает
+    // счётчик откатов.
+    baseline(&mut journal, 1);
+    let grant = Record::draft(
+        1, 0, journal.len() as u64, ACTOR, EventKind::CapGrant, TaintFlags::empty(),
+        Vec::new(), veridos_journal::reachability::encode_cap("x.cap"),
+    );
+    journal.append(grant, &mk(1, 0)).expect("human grant");
+    let r = lp.tick(&mut journal, &ROOT, 1, 2500, None).expect("tick drain");
+    assert_eq!(r.executed, 1);
     // Счётчик откатов сброшен: 2 неудачи после resume не ставят на паузу.
-    lp.submit(upd(Target::Cell, &[], &[], false), Vec::new());
-    lp.submit(upd(Target::Cell, &[], &[], false), Vec::new());
+    // Регресс по errors: добавление права даёт errors_canary=1 > базы 0.
+    lp.submit(upd(Target::Cell, &["x.cap"], &[], false), Vec::new());
+    lp.submit(upd(Target::Cell, &["x.cap"], &[], false), Vec::new());
     let r = lp.tick(&mut journal, &ROOT, 1, 3000, None).expect("tick after resume");
     assert_eq!(r.rolled_back, 2);
     assert_eq!(r.status, LoopStatus::Running);
@@ -185,6 +211,7 @@ fn pause_blocks_until_owner_resume_and_resets_counter() {
 fn model_tier_present_via_cbor_decode() {
     let mut journal = Journal::new();
     let mut lp = EvolutionLoop::new(config(10, 10));
+    baseline(&mut journal, 1);
     anomaly(&mut journal, 1);
     lp.tick(&mut journal, &ROOT, 1, 1000, None).expect("tick1");
     lp.tick(&mut journal, &ROOT, 1, 2000, None).expect("tick2");
@@ -204,6 +231,7 @@ fn model_tier_present_via_cbor_decode() {
 fn chain_and_replay_intact_after_full_cascade() {
     let mut journal = Journal::new();
     let mut lp = EvolutionLoop::new(config(10, 10));
+    baseline(&mut journal, 1);
     anomaly(&mut journal, 1);
     lp.tick(&mut journal, &ROOT, 1, 1000, None).expect("tick1"); // execute + A->B
     anomaly(&mut journal, 1);
@@ -256,8 +284,9 @@ fn forged_mac_human_grant_freezes_loop_without_writes() {
 #[test]
 fn task_end_trigger_causality_and_taint_reach_canary() {
     let mut journal = Journal::new();
+    baseline(&mut journal, 1);
     let trigger = Record::draft(
-        1, 0, 0, 901, EventKind::TaskEnd,
+        1, 0, journal.len() as u64, 901, EventKind::TaskEnd,
         TaintFlags::LLM_OUTPUT | TaintFlags::UNVALIDATED, Vec::new(), Vec::new(),
     );
     let trigger_seq = journal.append(trigger, &mk(1, 0)).expect("tainted task_end");
