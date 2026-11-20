@@ -8,7 +8,7 @@ use alloc::vec::Vec;
 pub const THRESHOLD: usize = 4096;
 
 /// In-memory CAS: ключ — BLAKE3-хеш содержимого (32 байта).
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Cas {
     store: BTreeMap<[u8; 32], Vec<u8>>,
 }
