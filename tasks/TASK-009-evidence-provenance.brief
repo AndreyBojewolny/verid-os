@@ -1,0 +1,77 @@
+TASK-009: provenance свидетельств — доверенная база, обязательная родословная
+
+## Цель
+Закрыть OBS-1 аудита TASK-008 (база non-regression принимается из любого
+домена/актора) и Info-1 TASK-007 (submit без родословной): недоверенная
+клетка не сможет авторизовать собственные обновления «хорошей» телеметрией,
+каждое решение петли прослеживается до триггера. Предпосылка интеграции
+недоверенного генератора (этап B+). Попутно: Info-1/2/3 аудита TASK-008.
+
+## Вход
+- master (v0.4.0, d91a604)
+- reports/auditor-report-sandbox-checker-recheck.md (OBS-1, Info-1/2/3)
+- reports/integrator-submit-causality.md (Info-1: политика родословной)
+- src/loop/engine.rs: MetricsSandbox::baseline, CanaryCtx, submit()
+
+## Архитектура (утверждена владельцем)
+1. Provenance базы: база non-regression = только фоновая Telemetry
+   домена 0 (L0/монитор владельца) с пустым taint, anomaly=0, canary!=1,
+   seq < update_seq. Телеметрия клеток (домен 16+) полностью игнорируется
+   как свидетельство (не «tainted-evidence», а отсутствие базы ->
+   fail-closed «no-baseline»). Taint на домен-0 записи по-прежнему
+   «tainted-evidence».
+2. Обязательная родословная: submit() с пустой causality отклоняется
+   немедленно, до постановки в очередь и до мутации журнала
+   (Result<(), SubmitError>, новый тип ошибки в src/loop; AppendError в
+   src/journal не трогаем). Авто-путь Monitor не затронут (causality
+   триггера всегда непустая). Неизвестный родитель по-прежнему
+   отклоняется в тике (AppendError::UnknownParent).
+3. Сужение CanaryCtx: широкий &mut Journal убирается из публичного API
+   песочницы. Узкий handle: запись ТОЛЬКО канареечной Telemetry
+   (canary=1, causality=[update_seq], домен 0, TaintFlags::empty(),
+   ключ-параметр) + чтение журнала (&Journal). Произвольный append
+   песочнице недоступен. Trait Sandbox и обе реализации адаптируются.
+4. Info-1 (харденинг): latency_tolerance_pct u64 -> i64 через try_from;
+   ошибка конверсии = fail-closed откат с машинной причиной (без паник).
+5. Info-3 (документация): семантика «очередь сохраняется на паузе,
+   исполняется первым тиком после owner_resume» фиксируется док-гарантиями
+   submit/tick и тестом; поведение не меняется.
+6. Красные линии 1–5, порядок проверок execute (целостность -> L0/Loop ->
+   overgrant-гейт -> канарейка) и гейт reachability не меняются.
+7. Детерминизм: идентичные журналы и очередь -> идентичный state_hash.
+
+## Решения владельца (приняты 2026-11-19)
+- Решение 1 — provenance: только домен 0 (без белых списков и без
+  требования VALIDATED — поток Validate ещё не построен).
+- Решение 2 — родословная: обязательная непустая causality для submit(),
+  fail-closed до мутации; без флага в Config.
+- Решение 3 — CanaryCtx: сузить сейчас, пока trait молодой (2 реализации).
+- Решение 4 — очередь на паузе: задокументировать текущую семантику,
+  поведение не менять.
+
+## Требования
+1. Регрессионные тесты: валидная untainted-телеметрия клетки (домен 16)
+   НЕ авторизует обновление (no-baseline откат); домен-0 база работает;
+   tainted домен-0 -> tainted-evidence; submit с пустой causality ->
+   Err без побочных эффектов (журнал и очередь не тронуты); submit с
+   непустой causality проходит как прежде; песочница не может писать
+   произвольные записи (тип-уровень + тест).
+2. Существующий тест untainted_cell_domain_telemetry_counts_as_baseline
+   (фиксация OBS-1) инвертируется под новую политику; остальные тесты
+   петли адаптируются: все submit(..., Vec::new()) получают реальные
+   триггерные записи с causality. Красные линии не ослаблены.
+3. Все pub fn с гарантиями в док-комментариях; сборка без предупреждений;
+   cargo test --release и clippy в зоне зелёные; пины diff-v1/diff-v2
+   стабильны (ядро журнала не меняется).
+
+## Зона файлов
+- src/loop/engine.rs, src/loop/payload.rs, src/loop/mod.rs
+- tests/evolution_loop_tests.rs, tests/verifier_evolution_loop.rs,
+  tests/verifier_submit_causality.rs, tests/sandbox_checker_tests.rs,
+  tests/verifier_sandbox_checker.rs, tasks/
+- Запрещено: src/journal/**, src/reachability/**, specs/docs/agents/workflows,
+  мержи в master, ключи в коде.
+
+## Формат сдачи
+- Ветка feature/evidence-provenance + отчёт reports/implementer-evidence-provenance.md
+- Далее по пайплайну: VERIFIER -> AUDITOR -> human-gate -> INTEGRATOR (тег v0.4.1).

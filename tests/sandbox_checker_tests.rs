@@ -1,12 +1,15 @@
 //! Тесты песочницы-оценщика TASK-008: независимость checker'а от самооценки
 //! генератора, fail-closed (нет базы / tainted-база), граница допуска,
 //! errors-регресс, родословная канареечной телеметрии, детерминизм.
+//! TASK-009: provenance базы (домен 0), обязательная родословная submit,
+//! узкий CanaryJournal, fail-closed недопустимый допуск.
 
 use ciborium::value::Value;
 use veridos_journal::evolution_loop::{
-    payload, Config, EvolutionLoop, LoopStatus, MetricsSandbox, ProposedUpdate, RulesSandbox, Target,
+    payload, CanaryCtx, CanaryOutcome, Config, EvolutionLoop, LoopStatus, MetricsSandbox,
+    ProposedUpdate, RulesSandbox, Sandbox, SubmitError, Target,
 };
-use veridos_journal::journal::{mac, EventKind, Journal, Record, TaintFlags, WarnSink};
+use veridos_journal::journal::{mac, AppendError, EventKind, Journal, Record, TaintFlags, WarnSink};
 
 const ROOT: [u8; 32] = [61u8; 32];
 const EPOCH: u32 = 1;
@@ -31,6 +34,16 @@ fn telemetry(journal: &mut Journal, metric: &str, value: i64, anomaly: bool, tai
 fn baseline(journal: &mut Journal, latency: i64) {
     telemetry(journal, "latency", latency, false, TaintFlags::empty());
     telemetry(journal, "errors", 0, false, TaintFlags::empty());
+}
+
+/// Чистый триггер-якорь для обязательной родословной submit (TASK-009).
+/// McpResponse не триггерит Monitor — счётчики тика не меняются.
+fn anchor(journal: &mut Journal) -> u64 {
+    let rec = Record::draft(
+        EPOCH, 0, journal.len() as u64, 900, EventKind::McpResponse,
+        TaintFlags::empty(), Vec::new(), Vec::new(),
+    );
+    journal.append(rec, &mk(0)).expect("anchor")
 }
 
 fn human_grant(journal: &mut Journal, cap: &str) {
@@ -73,19 +86,19 @@ impl WarnSink for CollectSink {
 #[test]
 fn checker_ignores_self_reported_verdict() {
     // canary_pass=true, но базы нет -> fail-closed откат.
-    let mut j = Journal::new();
+    let mut journal = Journal::new();
     let mut lp = EvolutionLoop::new(config(25));
-    lp.submit(update(&[], &[], true), Vec::new());
-    let r = lp.tick(&mut j, &ROOT, EPOCH, 1000, None).expect("tick");
+    lp.submit(update(&[], &[], true), vec![anchor(&mut journal)]).expect("submit");
+    let r = lp.tick(&mut journal, &ROOT, EPOCH, 1000, None).expect("tick");
     assert_eq!(r.rolled_back, 1);
     assert_eq!(r.executed, 0);
 
     // canary_pass=false, но метрики в норме -> применяется.
-    let mut j = Journal::new();
-    baseline(&mut j, 200);
+    let mut journal = Journal::new();
+    baseline(&mut journal, 200);
     let mut lp = EvolutionLoop::new(config(25));
-    lp.submit(update(&[], &[], false), Vec::new());
-    let r = lp.tick(&mut j, &ROOT, EPOCH, 1000, None).expect("tick");
+    lp.submit(update(&[], &[], false), vec![anchor(&mut journal)]).expect("submit");
+    let r = lp.tick(&mut journal, &ROOT, EPOCH, 1000, None).expect("tick");
     assert_eq!(r.executed, 1);
     assert_eq!(r.rolled_back, 0);
 }
@@ -94,7 +107,7 @@ fn checker_ignores_self_reported_verdict() {
 fn missing_baseline_fails_closed() {
     let mut journal = Journal::new();
     let mut lp = EvolutionLoop::new(config(25));
-    lp.submit(update(&[], &[], true), Vec::new());
+    lp.submit(update(&[], &[], true), vec![anchor(&mut journal)]).expect("submit");
     let r = lp.tick(&mut journal, &ROOT, EPOCH, 1000, None).expect("tick");
     assert_eq!(r.rolled_back, 1);
     let canary = canary_of(&journal);
@@ -117,7 +130,7 @@ fn tainted_baseline_fails_closed() {
     let mut lp = EvolutionLoop::new(config(25));
     let sink = CollectSink::default();
     lp.set_sink(Box::new(sink.clone()));
-    lp.submit(update(&[], &[], true), Vec::new());
+    lp.submit(update(&[], &[], true), vec![anchor(&mut journal)]).expect("submit");
     let r = lp.tick(&mut journal, &ROOT, EPOCH, 1000, None).expect("tick");
     assert_eq!(r.rolled_back, 1);
     assert_eq!(r.executed, 0);
@@ -133,7 +146,7 @@ fn tolerance_boundary_exact_passes() {
     human_grant(&mut journal, "a.cap");
     let mut lp = EvolutionLoop::new(config(25));
     // Одно изменение capability: latency_canary = 100 + 25 = 125 — ровно граница.
-    lp.submit(update(&[], &["a.cap"], false), Vec::new());
+    lp.submit(update(&[], &["a.cap"], false), vec![anchor(&mut journal)]).expect("submit");
     let r = lp.tick(&mut journal, &ROOT, EPOCH, 1000, None).expect("tick");
     assert_eq!(r.executed, 1);
     assert_eq!(field(&canary_of(&journal).payload, "reason"), Some(Value::Text("non-regression".into())));
@@ -148,7 +161,7 @@ fn tolerance_boundary_above_fails() {
     human_grant(&mut journal, "b.cap");
     let mut lp = EvolutionLoop::new(config(25));
     // Два изменения: latency_canary = 150 > 125.
-    lp.submit(update(&[], &["a.cap", "b.cap"], true), Vec::new());
+    lp.submit(update(&[], &["a.cap", "b.cap"], true), vec![anchor(&mut journal)]).expect("submit");
     let r = lp.tick(&mut journal, &ROOT, EPOCH, 1000, None).expect("tick");
     assert_eq!(r.rolled_back, 1);
     assert_eq!(field(&canary_of(&journal).payload, "reason"), Some(Value::Text("latency-regression".into())));
@@ -166,7 +179,7 @@ fn errors_regression_rejects_even_within_latency_tolerance() {
     human_grant(&mut journal, "x.cap");
     let mut lp = EvolutionLoop::new(config(25));
     // latency_canary = 125 <= 250, но errors_canary = 1 > базы 0.
-    lp.submit(update(&["x.cap"], &[], true), Vec::new());
+    lp.submit(update(&["x.cap"], &[], true), vec![anchor(&mut journal)]).expect("submit");
     let r = lp.tick(&mut journal, &ROOT, EPOCH, 1000, None).expect("tick");
     assert_eq!(r.rolled_back, 1);
     assert_eq!(field(&canary_of(&journal).payload, "reason"), Some(Value::Text("errors-regression".into())));
@@ -179,7 +192,7 @@ fn canary_telemetry_carries_update_lineage() {
     let mut journal = Journal::new();
     baseline(&mut journal, 200);
     let mut lp = EvolutionLoop::new(config(25));
-    lp.submit(update(&[], &[], true), Vec::new());
+    lp.submit(update(&[], &[], true), vec![anchor(&mut journal)]).expect("submit");
     lp.tick(&mut journal, &ROOT, EPOCH, 1000, None).expect("tick");
     let upd = journal.iter().find(|r| r.kind == EventKind::CodeUpdate).expect("update");
     let run: Vec<&Record> = journal
@@ -210,7 +223,7 @@ fn tolerance_comes_from_config() {
     let mut lp = EvolutionLoop::new(config(25));
     // Нулевой допуск: 125 > 100 -> откат, хотя default 25% прошёл бы.
     lp.set_sandbox(Box::new(MetricsSandbox::new(0)));
-    lp.submit(update(&[], &["a.cap"], true), Vec::new());
+    lp.submit(update(&[], &["a.cap"], true), vec![anchor(&mut journal)]).expect("submit");
     let r = lp.tick(&mut journal, &ROOT, EPOCH, 1000, None).expect("tick");
     assert_eq!(r.rolled_back, 1);
     assert_eq!(field(&canary_of(&journal).payload, "reason"), Some(Value::Text("latency-regression".into())));
@@ -221,7 +234,7 @@ fn canary_result_records_measured_evidence() {
     let mut journal = Journal::new();
     baseline(&mut journal, 200);
     let mut lp = EvolutionLoop::new(config(25));
-    lp.submit(update(&[], &[], true), Vec::new());
+    lp.submit(update(&[], &[], true), vec![anchor(&mut journal)]).expect("submit");
     lp.tick(&mut journal, &ROOT, EPOCH, 1000, None).expect("tick");
     let canary = canary_of(&journal);
     assert_eq!(field(&canary.payload, "passed"), Some(Value::Integer(1.into())));
@@ -239,7 +252,7 @@ fn rules_sandbox_is_explicit_opt_in_only() {
     baseline(&mut journal, 200);
     let mut lp = EvolutionLoop::new(config(25));
     lp.set_sandbox(Box::new(RulesSandbox));
-    lp.submit(update(&[], &[], false), Vec::new());
+    lp.submit(update(&[], &[], false), vec![anchor(&mut journal)]).expect("submit");
     let r = lp.tick(&mut journal, &ROOT, EPOCH, 1000, None).expect("tick");
     assert_eq!(r.rolled_back, 1);
     assert_eq!(field(&canary_of(&journal).payload, "reason"), Some(Value::Text("self-reported".into())));
@@ -250,21 +263,21 @@ fn tainted_background_telemetry_poisons_baseline_until_clean() {
     let mut journal = Journal::new();
     baseline(&mut journal, 200);
     let mut lp = EvolutionLoop::new(config(25));
-    lp.submit(update(&[], &[], true), Vec::new());
+    lp.submit(update(&[], &[], true), vec![anchor(&mut journal)]).expect("submit");
     let r = lp.tick(&mut journal, &ROOT, EPOCH, 1000, None).expect("tick1");
     assert_eq!(r.executed, 1);
 
     // Tainted-фоновое измерение становится последней нормальной записью
     // метрики -> следующее обновление fail-closed.
     telemetry(&mut journal, "latency", 200, false, TaintFlags::EXTERNAL_NET);
-    lp.submit(update(&[], &[], true), Vec::new());
+    lp.submit(update(&[], &[], true), vec![anchor(&mut journal)]).expect("submit");
     let r = lp.tick(&mut journal, &ROOT, EPOCH, 2000, None).expect("tick2");
     assert_eq!(r.rolled_back, 1);
     assert_eq!(field(&canary_of(&journal).payload, "reason"), Some(Value::Text("tainted-evidence".into())));
 
     // Свежая чистая телеметрия восстанавливает базу.
     baseline(&mut journal, 200);
-    lp.submit(update(&[], &[], true), Vec::new());
+    lp.submit(update(&[], &[], true), vec![anchor(&mut journal)]).expect("submit");
     let r = lp.tick(&mut journal, &ROOT, EPOCH, 3000, None).expect("tick3");
     assert_eq!(r.executed, 1);
     journal.verify_chain(0..journal.len() as u64, &ROOT).expect("chain valid");
@@ -276,8 +289,8 @@ fn canary_run_records_are_not_baseline() {
     // прогонов checker'а не создают базу (иначе петля сама себя авторизует).
     let mut journal = Journal::new();
     let mut lp = EvolutionLoop::new(config(25));
-    lp.submit(update(&[], &[], true), Vec::new());
-    lp.submit(update(&[], &[], true), Vec::new());
+    lp.submit(update(&[], &[], true), vec![anchor(&mut journal)]).expect("submit");
+    lp.submit(update(&[], &[], true), vec![anchor(&mut journal)]).expect("submit");
     let r = lp.tick(&mut journal, &ROOT, EPOCH, 1000, None).expect("tick");
     assert_eq!(r.rolled_back, 2);
     assert_eq!(r.executed, 0);
@@ -290,7 +303,7 @@ fn deterministic_with_checker() {
         baseline(&mut journal, 200);
         telemetry(&mut journal, "latency", 500, true, TaintFlags::empty());
         let mut lp = EvolutionLoop::new(config(25));
-        lp.submit(update(&[], &[], true), Vec::new());
+        lp.submit(update(&[], &[], true), vec![anchor(&mut journal)]).expect("submit");
         lp.tick(&mut journal, &ROOT, EPOCH, 1000, None).expect("tick");
         journal.state_hash()
     };
@@ -302,7 +315,7 @@ fn three_fail_closed_rollbacks_pause_loop() {
     let mut journal = Journal::new();
     let mut lp = EvolutionLoop::new(config(25));
     for _ in 0..3 {
-        lp.submit(update(&[], &[], true), Vec::new());
+        lp.submit(update(&[], &[], true), vec![anchor(&mut journal)]).expect("submit");
     }
     let r = lp.tick(&mut journal, &ROOT, EPOCH, 1000, None).expect("tick");
     assert_eq!(r.rolled_back, 3);
@@ -341,7 +354,7 @@ fn anomaly_flag_outside_01_is_invalid() {
     append_raw(&mut journal, raw_telemetry("latency", 1_000_000, 2, None));
     telemetry(&mut journal, "errors", 0, false, TaintFlags::empty());
     let mut lp = EvolutionLoop::new(config(25));
-    lp.submit(update(&[], &[], true), Vec::new());
+    lp.submit(update(&[], &[], true), vec![anchor(&mut journal)]).expect("submit");
     let r = lp.tick(&mut journal, &ROOT, EPOCH, 1000, None).expect("tick");
     assert_eq!(r.triggers, 0);
     assert_eq!(r.rolled_back, 1);
@@ -355,7 +368,7 @@ fn canary_flag_outside_01_is_invalid() {
     append_raw(&mut journal, raw_telemetry("latency", 200, 0, Some(2)));
     telemetry(&mut journal, "errors", 0, false, TaintFlags::empty());
     let mut lp = EvolutionLoop::new(config(25));
-    lp.submit(update(&[], &[], true), Vec::new());
+    lp.submit(update(&[], &[], true), vec![anchor(&mut journal)]).expect("submit");
     let r = lp.tick(&mut journal, &ROOT, EPOCH, 1000, None).expect("tick");
     assert_eq!(r.rolled_back, 1);
     assert_eq!(field(&canary_of(&journal).payload, "reason"), Some(Value::Text("no-baseline".into())));
@@ -368,7 +381,126 @@ fn explicit_canary_zero_is_background() {
     append_raw(&mut journal, raw_telemetry("latency", 200, 0, Some(0)));
     telemetry(&mut journal, "errors", 0, false, TaintFlags::empty());
     let mut lp = EvolutionLoop::new(config(25));
-    lp.submit(update(&[], &[], true), Vec::new());
+    lp.submit(update(&[], &[], true), vec![anchor(&mut journal)]).expect("submit");
     let r = lp.tick(&mut journal, &ROOT, EPOCH, 1000, None).expect("tick");
     assert_eq!(r.executed, 1);
+}
+
+// --- TASK-009: provenance базы, обязательная родословная, узкий CanaryCtx. ---
+
+#[test]
+fn submit_empty_lineage_rejected_without_side_effects() {
+    let mut journal = Journal::new();
+    baseline(&mut journal, 200);
+    let mut lp = EvolutionLoop::new(config(25));
+    let len = journal.len();
+    let hash = journal.state_hash();
+    assert_eq!(lp.submit(update(&[], &[], true), Vec::new()), Err(SubmitError::EmptyLineage));
+    // Ни журнал, ни очередь не тронуты: тик ничего не исполняет.
+    assert_eq!(journal.len(), len);
+    assert_eq!(journal.state_hash(), hash);
+    let r = lp.tick(&mut journal, &ROOT, EPOCH, 1000, None).expect("tick");
+    assert_eq!(r.executed, 0);
+    assert_eq!(r.rolled_back, 0);
+    assert_eq!(journal.len(), len);
+    // Валидная родословная после отказа проходит.
+    lp.submit(update(&[], &[], true), vec![anchor(&mut journal)]).expect("submit");
+    let r = lp.tick(&mut journal, &ROOT, EPOCH, 2000, None).expect("tick");
+    assert_eq!(r.executed, 1);
+}
+
+#[test]
+fn cell_domain_telemetry_is_not_baseline() {
+    let mut journal = Journal::new();
+    // Валидная чистая телеметрия клетки (домен 16) — не свидетельство.
+    for (metric, value) in [("latency", 200i64), ("errors", 0)] {
+        let rec = Record::draft(
+            EPOCH, 16, journal.len() as u64, 555, EventKind::Telemetry,
+            TaintFlags::empty(), Vec::new(), payload::telemetry(metric, value, false),
+        );
+        journal.append(rec, &mk(16)).expect("cell telemetry");
+    }
+    let mut lp = EvolutionLoop::new(config(25));
+    lp.submit(update(&[], &[], true), vec![anchor(&mut journal)]).expect("submit");
+    let r = lp.tick(&mut journal, &ROOT, EPOCH, 1000, None).expect("tick");
+    assert_eq!(r.rolled_back, 1);
+    assert_eq!(r.executed, 0);
+    assert_eq!(field(&canary_of(&journal).payload, "reason"), Some(Value::Text("no-baseline".into())));
+}
+
+#[test]
+fn domain0_baseline_ignores_cell_telemetry() {
+    let mut journal = Journal::new();
+    baseline(&mut journal, 200);
+    // Клетка шлёт «улучшенную» телеметрию — база не меняется (домен 0).
+    for (metric, value) in [("latency", 1i64), ("errors", 0)] {
+        let rec = Record::draft(
+            EPOCH, 16, journal.len() as u64, 555, EventKind::Telemetry,
+            TaintFlags::empty(), Vec::new(), payload::telemetry(metric, value, false),
+        );
+        journal.append(rec, &mk(16)).expect("cell telemetry");
+    }
+    human_grant(&mut journal, "a.cap");
+    let mut lp = EvolutionLoop::new(config(25));
+    // latency_canary = 125 <= 250 (база домена 0 = 200, не клеточная 1).
+    lp.submit(update(&[], &["a.cap"], true), vec![anchor(&mut journal)]).expect("submit");
+    let r = lp.tick(&mut journal, &ROOT, EPOCH, 1000, None).expect("tick");
+    assert_eq!(r.executed, 1);
+    assert_eq!(field(&canary_of(&journal).payload, "latency_base"), Some(Value::Integer(200.into())));
+}
+
+struct HandleProbe;
+
+impl Sandbox for HandleProbe {
+    fn evaluate(
+        &mut self,
+        _update: &ProposedUpdate,
+        ctx: &mut CanaryCtx<'_>,
+    ) -> Result<CanaryOutcome, AppendError> {
+        let seq = ctx.journal.record_canary("latency", 42)?;
+        let rec = ctx.journal.journal().get(seq).expect("canary record");
+        assert_eq!(rec.domain, 0);
+        assert!(rec.taint.is_empty());
+        assert_eq!(rec.causality, vec![ctx.update_seq]);
+        let (_, _, anomaly, canary) = payload::telemetry_metric(&rec.payload).expect("metric");
+        assert!(!anomaly);
+        assert!(canary);
+        Ok(CanaryOutcome {
+            passed: true,
+            reason: "non-regression",
+            latency_base: None,
+            latency_canary: Some(42),
+            errors_base: None,
+            errors_canary: None,
+        })
+    }
+}
+
+#[test]
+fn canary_handle_writes_only_canary_telemetry() {
+    let mut journal = Journal::new();
+    let mut lp = EvolutionLoop::new(config(25));
+    lp.set_sandbox(Box::new(HandleProbe));
+    lp.submit(update(&[], &[], true), vec![anchor(&mut journal)]).expect("submit");
+    let r = lp.tick(&mut journal, &ROOT, EPOCH, 1000, None).expect("tick");
+    assert_eq!(r.executed, 1);
+    let runs: Vec<&Record> = journal.iter().filter(|rec| rec.kind == EventKind::Telemetry).collect();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].causality.len(), 1);
+    journal.verify_chain(0..journal.len() as u64, &ROOT).expect("chain valid");
+}
+
+#[test]
+fn invalid_tolerance_config_fails_closed() {
+    let mut journal = Journal::new();
+    baseline(&mut journal, 200);
+    let mut lp = EvolutionLoop::new(config(25));
+    // Допуск не представим в i64 -> fail-closed откат без паники.
+    lp.set_sandbox(Box::new(MetricsSandbox::new(u64::MAX)));
+    lp.submit(update(&[], &[], true), vec![anchor(&mut journal)]).expect("submit");
+    let r = lp.tick(&mut journal, &ROOT, EPOCH, 1000, None).expect("tick");
+    assert_eq!(r.rolled_back, 1);
+    assert_eq!(r.executed, 0);
+    assert_eq!(field(&canary_of(&journal).payload, "reason"), Some(Value::Text("invalid-config".into())));
+    journal.verify_chain(0..journal.len() as u64, &ROOT).expect("chain valid");
 }

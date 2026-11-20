@@ -39,6 +39,16 @@ fn anomaly(journal: &mut Journal, epoch: u32) -> u64 {
     journal.append(rec, &mk(epoch, 0)).expect("telemetry")
 }
 
+/// Чистый триггер-якорь для обязательной родословной submit (TASK-009).
+/// McpResponse не триггерит Monitor — счётчики тика не меняются.
+fn anchor(journal: &mut Journal) -> u64 {
+    let rec = Record::draft(
+        1, 0, journal.len() as u64, 901, EventKind::McpResponse,
+        TaintFlags::empty(), Vec::new(), Vec::new(),
+    );
+    journal.append(rec, &mk(1, 0)).expect("anchor")
+}
+
 fn upd(target: Target, caps_add: &[&str], caps_del: &[&str], canary_pass: bool) -> ProposedUpdate {
     ProposedUpdate {
         target,
@@ -63,13 +73,13 @@ fn overgrant_attempts_are_per_epoch() {
     let mut journal = Journal::new();
     let mut lp = EvolutionLoop::new(config(100, 10));
     // 2 попытки в эпохе 1.
-    lp.submit(upd(Target::Cell, &["key.sign"], &[], true), Vec::new());
-    lp.submit(upd(Target::Cell, &["key.sign"], &[], true), Vec::new());
+    lp.submit(upd(Target::Cell, &["key.sign"], &[], true), vec![anchor(&mut journal)]).expect("submit");
+    lp.submit(upd(Target::Cell, &["key.sign"], &[], true), vec![anchor(&mut journal)]).expect("submit");
     let r = lp.tick(&mut journal, &ROOT, 1, 1000, None).expect("tick e1");
     assert_eq!(r.rejected, 2);
     assert_eq!(r.status, LoopStatus::Running);
     // 1 попытка в эпохе 2: суммарно 3, но счётчик по эпохе — не останавливать.
-    lp.submit(upd(Target::Cell, &["key.sign"], &[], true), Vec::new());
+    lp.submit(upd(Target::Cell, &["key.sign"], &[], true), vec![anchor(&mut journal)]).expect("submit");
     let r = lp.tick(&mut journal, &ROOT, 2, 2000, None).expect("tick e2");
     assert_eq!(r.rejected, 1);
     assert_eq!(r.status, LoopStatus::Running);
@@ -79,7 +89,7 @@ fn overgrant_attempts_are_per_epoch() {
 fn state_hash_divergence_outranks_l0_attempt() {
     let mut journal = Journal::new();
     let mut lp = EvolutionLoop::new(config(100, 10));
-    lp.submit(upd(Target::L0, &[], &[], true), Vec::new());
+    lp.submit(upd(Target::L0, &[], &[], true), vec![anchor(&mut journal)]).expect("submit");
     let r = lp.tick(&mut journal, &ROOT, 1, 1000, Some([0xBB; 32])).expect("tick");
     assert_eq!(r.status, LoopStatus::Frozen);
     let freeze_details: Vec<String> = journal
@@ -97,7 +107,7 @@ fn state_hash_divergence_outranks_l0_attempt() {
 fn l0_attempt_writes_no_code_update_record() {
     let mut journal = Journal::new();
     let mut lp = EvolutionLoop::new(config(100, 10));
-    lp.submit(upd(Target::L0, &[], &[], true), Vec::new());
+    lp.submit(upd(Target::L0, &[], &[], true), vec![anchor(&mut journal)]).expect("submit");
     lp.tick(&mut journal, &ROOT, 1, 1000, None).expect("tick");
     assert!(!journal.iter().any(|rec| rec.kind == EventKind::CodeUpdate));
 }
@@ -113,7 +123,7 @@ fn canary_rollback_really_prevents_capability_change() {
 
     let mut lp = EvolutionLoop::new(config(100, 10));
     // Базы нет -> checker fail-closed: отзыв не применяется даже без canary_pass.
-    lp.submit(upd(Target::Cell, &[], &["fs.read"], false), Vec::new());
+    lp.submit(upd(Target::Cell, &[], &["fs.read"], false), vec![anchor(&mut journal)]).expect("submit");
     let r = lp.tick(&mut journal, &ROOT, 1, 1000, None).expect("tick");
     assert_eq!(r.rolled_back, 1);
     assert_eq!(r.executed, 0);
@@ -127,8 +137,8 @@ fn canary_rollback_really_prevents_capability_change() {
 fn rejected_updates_do_not_consume_budget() {
     let mut journal = Journal::new();
     let mut lp = EvolutionLoop::new(config(100, 10));
-    lp.submit(upd(Target::Cell, &["key.sign"], &[], true), Vec::new()); // overgrant -> reject
-    lp.submit(upd(Target::Cell, &[], &[], false), Vec::new()); // нет базы -> fail-closed rollback
+    lp.submit(upd(Target::Cell, &["key.sign"], &[], true), vec![anchor(&mut journal)]).expect("submit"); // overgrant -> reject
+    lp.submit(upd(Target::Cell, &[], &[], false), vec![anchor(&mut journal)]).expect("submit"); // нет базы -> fail-closed rollback
     let r = lp.tick(&mut journal, &ROOT, 1, 1000, None).expect("tick");
     assert_eq!(r.rejected, 1);
     assert_eq!(r.rolled_back, 1);
@@ -175,13 +185,13 @@ fn pause_blocks_until_owner_resume_and_resets_counter() {
     let mut lp = EvolutionLoop::new(config(100, 10));
     // Базы нет -> checker fail-closed откатывает каждое из трёх.
     for _ in 0..3 {
-        lp.submit(upd(Target::Cell, &[], &[], false), Vec::new());
+        lp.submit(upd(Target::Cell, &[], &[], false), vec![anchor(&mut journal)]).expect("submit");
     }
     lp.tick(&mut journal, &ROOT, 1, 1000, None).expect("tick");
     assert_eq!(lp.status(), LoopStatus::PausedHuman);
 
     // Пауза блокирует исполнение.
-    lp.submit(upd(Target::Cell, &[], &[], true), Vec::new());
+    lp.submit(upd(Target::Cell, &[], &[], true), vec![anchor(&mut journal)]).expect("submit");
     let len = journal.len();
     lp.tick(&mut journal, &ROOT, 1, 2000, None).expect("tick paused");
     assert_eq!(journal.len(), len);
@@ -200,8 +210,8 @@ fn pause_blocks_until_owner_resume_and_resets_counter() {
     assert_eq!(r.executed, 1);
     // Счётчик откатов сброшен: 2 неудачи после resume не ставят на паузу.
     // Регресс по errors: добавление права даёт errors_canary=1 > базы 0.
-    lp.submit(upd(Target::Cell, &["x.cap"], &[], false), Vec::new());
-    lp.submit(upd(Target::Cell, &["x.cap"], &[], false), Vec::new());
+    lp.submit(upd(Target::Cell, &["x.cap"], &[], false), vec![anchor(&mut journal)]).expect("submit");
+    lp.submit(upd(Target::Cell, &["x.cap"], &[], false), vec![anchor(&mut journal)]).expect("submit");
     let r = lp.tick(&mut journal, &ROOT, 1, 3000, None).expect("tick after resume");
     assert_eq!(r.rolled_back, 2);
     assert_eq!(r.status, LoopStatus::Running);
@@ -271,7 +281,7 @@ fn forged_mac_human_grant_freezes_loop_without_writes() {
     assert!(journal.verify_chain(0..journal.len() as u64, &ROOT).is_err());
 
     let mut lp = EvolutionLoop::new(config(100, 10));
-    lp.submit(upd(Target::Cell, &["key.sign"], &[], true), Vec::new());
+    lp.submit(upd(Target::Cell, &["key.sign"], &[], true), vec![anchor(&mut journal)]).expect("submit");
     let len = journal.len();
     let hash = journal.state_hash();
     let r = lp.tick(&mut journal, &ROOT, 1, 1000, None).expect("tick");
