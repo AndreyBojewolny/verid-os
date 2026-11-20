@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use veridos_journal::evolution_loop::{
     payload, Config, EvolutionLoop, LoopStatus, ProposedUpdate, Target, Tier,
 };
-use veridos_journal::journal::{mac, EventKind, Journal, Record, TaintFlags, WarnSink};
+use veridos_journal::journal::{mac, AppendError, EventKind, Journal, Record, TaintFlags, WarnSink};
 
 const ROOT: [u8; 32] = [21u8; 32];
 const EPOCH: u32 = 1;
@@ -105,7 +105,7 @@ fn red_line_1_l0_change_freezes() {
     let mut lp = EvolutionLoop::new(config(100, 10));
     let sink = CollectSink::default();
     lp.set_sink(Box::new(sink.clone()));
-    lp.submit(update(Target::L0, &[], true));
+    lp.submit(update(Target::L0, &[], true), Vec::new());
 
     let report = lp.tick(&mut journal, &ROOT, EPOCH, 1000, None).expect("tick");
     assert_eq!(report.status, LoopStatus::Frozen);
@@ -113,7 +113,7 @@ fn red_line_1_l0_change_freezes() {
     assert!(sink.0.lock().unwrap().iter().any(|m| m.contains("RED LINE 1")));
 
     // Замороженная петля не исполняет даже разрешённые обновления.
-    lp.submit(update(Target::Cell, &[], true));
+    lp.submit(update(Target::Cell, &[], true), Vec::new());
     let len = journal.len();
     lp.tick(&mut journal, &ROOT, EPOCH, 2000, None).expect("tick");
     assert_eq!(journal.len(), len);
@@ -126,7 +126,7 @@ fn red_line_2_state_hash_divergence_freezes_with_priority() {
     let sink = CollectSink::default();
     lp.set_sink(Box::new(sink.clone()));
     telemetry(&mut journal, "latency", 500, true);
-    lp.submit(update(Target::Cell, &[], true));
+    lp.submit(update(Target::Cell, &[], true), Vec::new());
 
     let wrong_hash = [0xAAu8; 32];
     let report = lp.tick(&mut journal, &ROOT, EPOCH, 1000, Some(wrong_hash)).expect("tick");
@@ -152,7 +152,7 @@ fn red_line_3_overgrant_rollback_dlq_and_full_stop() {
     let sink = CollectSink::default();
     lp.set_sink(Box::new(sink.clone()));
     for _ in 0..3 {
-        lp.submit(update(Target::Cell, &["key.sign"], true));
+        lp.submit(update(Target::Cell, &["key.sign"], true), Vec::new());
     }
 
     let report = lp.tick(&mut journal, &ROOT, EPOCH, 1000, None).expect("tick");
@@ -173,7 +173,7 @@ fn red_line_3_overgrant_rollback_dlq_and_full_stop() {
 fn red_line_3_loop_self_modification_is_violation() {
     let mut journal = Journal::new();
     let mut lp = EvolutionLoop::new(config(100, 10));
-    lp.submit(update(Target::Loop, &[], true));
+    lp.submit(update(Target::Loop, &[], true), Vec::new());
     let report = lp.tick(&mut journal, &ROOT, EPOCH, 1000, None).expect("tick");
     assert_eq!(report.rejected, 1);
     assert_eq!(report.executed, 0);
@@ -187,7 +187,7 @@ fn red_line_4_three_consecutive_rollbacks_pause() {
     let sink = CollectSink::default();
     lp.set_sink(Box::new(sink.clone()));
     for _ in 0..3 {
-        lp.submit(update(Target::Cell, &[], false)); // canary fail
+        lp.submit(update(Target::Cell, &[], false), Vec::new()); // canary fail
     }
     let report = lp.tick(&mut journal, &ROOT, EPOCH, 1000, None).expect("tick");
     assert_eq!(report.rolled_back, 3);
@@ -202,11 +202,11 @@ fn red_line_4_three_consecutive_rollbacks_pause() {
 fn successful_canary_resets_rollback_counter() {
     let mut journal = Journal::new();
     let mut lp = EvolutionLoop::new(config(100, 10));
-    lp.submit(update(Target::Cell, &[], false));
-    lp.submit(update(Target::Cell, &[], false));
-    lp.submit(update(Target::Cell, &[], true)); // сброс счётчика
-    lp.submit(update(Target::Cell, &[], false));
-    lp.submit(update(Target::Cell, &[], false));
+    lp.submit(update(Target::Cell, &[], false), Vec::new());
+    lp.submit(update(Target::Cell, &[], false), Vec::new());
+    lp.submit(update(Target::Cell, &[], true), Vec::new()); // сброс счётчика
+    lp.submit(update(Target::Cell, &[], false), Vec::new());
+    lp.submit(update(Target::Cell, &[], false), Vec::new());
     let report = lp.tick(&mut journal, &ROOT, EPOCH, 1000, None).expect("tick");
     assert_eq!(report.status, LoopStatus::Running);
     assert_eq!(report.rolled_back, 4);
@@ -255,7 +255,7 @@ fn owner_resume_after_stop() {
     let mut journal = Journal::new();
     let mut lp = EvolutionLoop::new(config(100, 10));
     for _ in 0..3 {
-        lp.submit(update(Target::Cell, &["key.sign"], true));
+        lp.submit(update(Target::Cell, &["key.sign"], true), Vec::new());
     }
     lp.tick(&mut journal, &ROOT, EPOCH, 1000, None).expect("tick");
     assert_eq!(lp.status(), LoopStatus::Stopped);
@@ -265,7 +265,7 @@ fn owner_resume_after_stop() {
     assert!(phases(&journal).contains(&"resume".to_string()));
 
     // После разбора одно отклонение не останавливает петлю (счётчик сброшен).
-    lp.submit(update(Target::Cell, &["key.sign"], true));
+    lp.submit(update(Target::Cell, &["key.sign"], true), Vec::new());
     let report = lp.tick(&mut journal, &ROOT, EPOCH, 2000, None).expect("tick");
     assert_eq!(report.rejected, 1);
     assert_eq!(report.status, LoopStatus::Running);
@@ -297,7 +297,7 @@ fn deterministic_full_cycle() {
         let mut journal = Journal::new();
         let mut lp = EvolutionLoop::new(config(100, 10));
         telemetry(&mut journal, "latency", 500, true);
-        lp.submit(update(Target::Cell, &["fs.read"], true));
+        lp.submit(update(Target::Cell, &["fs.read"], true), Vec::new());
         lp.tick(&mut journal, &ROOT, EPOCH, 1000, None).expect("tick");
         journal.state_hash()
     };
@@ -318,7 +318,7 @@ fn applied_update_extends_capabilities_within_gate() {
 
     let mut upd = update(Target::Cell, &[], true);
     upd.caps_del = vec!["fs.read".to_string()];
-    lp.submit(upd);
+    lp.submit(upd, Vec::new());
     let report = lp.tick(&mut journal, &ROOT, EPOCH, 1000, None).expect("tick");
     assert_eq!(report.executed, 1);
     let graph = veridos_journal::reachability::CapabilityGraph::from_journal(&journal);
@@ -370,4 +370,55 @@ fn tampered_journal_freezes_loop_without_writes() {
     assert_eq!(report.status, LoopStatus::Frozen);
     assert_eq!(tampered.len(), len); // консервация: журнал не тронут
     assert!(sink.0.lock().unwrap().iter().any(|m| m.contains("integrity")));
+}
+
+#[test]
+fn submitted_proposal_lineage_inherits_taint_to_applied_caps() {
+    let mut journal = Journal::new();
+    let grant = Record::draft(
+        EPOCH, 0, 0, ACTOR, EventKind::CapGrant, TaintFlags::empty(), Vec::new(),
+        veridos_journal::reachability::encode_cap("fs.read"),
+    );
+    journal.append(grant, &mk(0)).expect("human grant");
+    let trigger = Record::draft(
+        EPOCH, 0, 1, 900, EventKind::McpResponse,
+        TaintFlags::EXTERNAL_NET | TaintFlags::UNVALIDATED, Vec::new(), Vec::new(),
+    );
+    let trigger_seq = journal.append(trigger, &mk(0)).expect("tainted trigger");
+
+    let mut lp = EvolutionLoop::new(config(100, 10));
+    let proposal = ProposedUpdate {
+        target: Target::Cell,
+        caps_add: Vec::new(),
+        caps_del: vec!["fs.read".to_string()],
+        canary_pass: true,
+    };
+    lp.submit(proposal, vec![trigger_seq]);
+    let report = lp.tick(&mut journal, &ROOT, EPOCH, 1000, None).expect("tick");
+    assert_eq!(report.executed, 1);
+
+    let upd = journal.iter().find(|r| r.kind == EventKind::CodeUpdate).expect("update");
+    assert_eq!(upd.causality, vec![trigger_seq]);
+    assert!(upd.taint.contains(TaintFlags::EXTERNAL_NET));
+    assert!(upd.taint.contains(TaintFlags::UNVALIDATED));
+    let canary = journal.iter().find(|r| r.kind == EventKind::CanaryResult).expect("canary");
+    assert_eq!(canary.causality, vec![upd.seq]);
+    assert!(canary.taint.contains(TaintFlags::EXTERNAL_NET));
+    let revoke = journal.iter().find(|r| r.kind == EventKind::CapRevoke).expect("revoke");
+    assert_eq!(revoke.causality, vec![upd.seq]);
+    assert!(revoke.taint.contains(TaintFlags::EXTERNAL_NET));
+    assert!(revoke.taint.contains(TaintFlags::UNVALIDATED));
+    journal.verify_chain(0..journal.len() as u64, &ROOT).expect("chain valid");
+}
+
+#[test]
+fn submitted_proposal_unknown_parent_rejected_without_side_effects() {
+    let mut journal = Journal::new();
+    let hash_before = journal.state_hash();
+    let mut lp = EvolutionLoop::new(config(100, 10));
+    lp.submit(update(Target::Cell, &[], true), vec![99]);
+    let result = lp.tick(&mut journal, &ROOT, EPOCH, 1000, None);
+    assert_eq!(result, Err(AppendError::UnknownParent(99)));
+    assert!(journal.is_empty());
+    assert_eq!(journal.state_hash(), hash_before);
 }

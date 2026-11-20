@@ -144,9 +144,13 @@ impl EvolutionLoop {
         self.sandbox = sandbox;
     }
 
-    /// Очередь предложений генератора. Гарантирует: порядок FIFO.
-    pub fn submit(&mut self, update: ProposedUpdate) {
-        self.queue.push((update, Vec::new()));
+    /// Очередь предложений генератора. Гарантирует: порядок FIFO; causality —
+    /// родословная предложения (seq записей-триггеров), наследуется журналом
+    /// по OR при записи CodeUpdate и далее по цепочке; пустая родословная
+    /// допустима и означает отсутствие заявленных триггеров (ответственность
+    /// генератора); неизвестный родитель отклоняется журналом при исполнении.
+    pub fn submit(&mut self, update: ProposedUpdate, causality: Vec<u64>) {
+        self.queue.push((update, causality));
     }
 
     /// Текущий ярус деградации.
@@ -413,7 +417,7 @@ impl EvolutionLoop {
             )?;
         }
         let after = CapabilityGraph::from_journal(&sim);
-        if let GateVerdict::Reject { .. } = gate_code_update(journal, key0, epoch, self.config.actor, &before, &after)? {
+        if let GateVerdict::Reject { .. } = gate_code_update(journal, key0, epoch, self.config.actor, update_seq, &before, &after)? {
             self.cycle(journal, epoch, key0, "rollback", "overgrant rejected by reachability gate")?;
             self.alert("RED LINE 3: overgrant attempt, rolled back, DLQ written");
             report.rejected += 1;

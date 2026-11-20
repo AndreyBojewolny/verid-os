@@ -75,8 +75,9 @@ fn gate_rejects_expansion_and_writes_dlq() {
     append(&mut after_journal, 16, CELL, EventKind::CapGrant, "key.sign");
     let after = CapabilityGraph::from_journal(&after_journal);
 
+    let update_seq = append(&mut journal, 16, CELL, EventKind::CodeUpdate, "update");
     let len_before = journal.len();
-    let verdict = gate_code_update(&mut journal, &KEY, EPOCH, CELL, &before, &after).expect("gate");
+    let verdict = gate_code_update(&mut journal, &KEY, EPOCH, CELL, update_seq, &before, &after).expect("gate");
     match verdict {
         GateVerdict::Reject { added, dlq_seq, .. } => {
             assert_eq!(added, vec![(CELL, "key.sign".into())]);
@@ -88,6 +89,7 @@ fn gate_rejects_expansion_and_writes_dlq() {
     let dlq = journal.get(journal.len() as u64 - 1).expect("dlq record");
     assert_eq!(dlq.kind, EventKind::DlqEntry);
     assert!(dlq.taint.contains(TaintFlags::DLQ));
+    assert_eq!(dlq.causality, vec![update_seq]);
 }
 
 #[test]
@@ -99,8 +101,9 @@ fn gate_allows_human_granted_expansion() {
     append(&mut after_journal, 0, CELL, EventKind::CapGrant, "key.sign");
     let after = CapabilityGraph::from_journal(&after_journal);
 
+    let update_seq = append(&mut journal, 16, CELL, EventKind::CodeUpdate, "update");
     let len_before = journal.len();
-    let verdict = gate_code_update(&mut journal, &KEY, EPOCH, CELL, &before, &after).expect("gate");
+    let verdict = gate_code_update(&mut journal, &KEY, EPOCH, CELL, update_seq, &before, &after).expect("gate");
     assert_eq!(verdict, GateVerdict::Allow);
     assert_eq!(journal.len(), len_before);
 }
@@ -113,8 +116,9 @@ fn gate_allows_reduction_without_records() {
     append(&mut after_journal, 16, CELL, EventKind::CapRevoke, "net.fetch");
     let after = CapabilityGraph::from_journal(&after_journal);
 
+    let update_seq = append(&mut journal, 16, CELL, EventKind::CodeUpdate, "update");
     let len_before = journal.len();
-    let verdict = gate_code_update(&mut journal, &KEY, EPOCH, CELL, &before, &after).expect("gate");
+    let verdict = gate_code_update(&mut journal, &KEY, EPOCH, CELL, update_seq, &before, &after).expect("gate");
     assert_eq!(verdict, GateVerdict::Allow);
     assert_eq!(journal.len(), len_before);
 }
@@ -132,7 +136,8 @@ fn revoked_human_grant_does_not_authorize_reexpansion() {
     append(&mut after_journal, 16, CELL, EventKind::CapGrant, "key.sign");
     let after = CapabilityGraph::from_journal(&after_journal);
 
-    let verdict = gate_code_update(&mut journal, &KEY, EPOCH, CELL, &before, &after).expect("gate");
+    let update_seq = append(&mut journal, 16, CELL, EventKind::CodeUpdate, "update");
+    let verdict = gate_code_update(&mut journal, &KEY, EPOCH, CELL, update_seq, &before, &after).expect("gate");
     assert!(matches!(verdict, GateVerdict::Reject { .. }));
 }
 
@@ -196,7 +201,8 @@ fn malformed_event_in_after_fails_closed() {
 
     // Расширения в графе нет, но malformed-грант невидим -> fail-closed.
     assert!(!overgrant_diff(&before, &after).expanded);
-    let verdict = gate_code_update(&mut journal, &KEY, EPOCH, CELL, &before, &after).expect("gate");
+    let update_seq = append(&mut journal, 16, CELL, EventKind::CodeUpdate, "update");
+    let verdict = gate_code_update(&mut journal, &KEY, EPOCH, CELL, update_seq, &before, &after).expect("gate");
     match verdict {
         GateVerdict::Reject { added, malformed, dlq_seq } => {
             assert!(added.is_empty());
@@ -219,7 +225,8 @@ fn malformed_event_in_before_fails_closed() {
     let before = CapabilityGraph::from_journal(&journal);
     let after = before.clone();
 
-    let verdict = gate_code_update(&mut journal, &KEY, EPOCH, CELL, &before, &after).expect("gate");
+    let update_seq = append(&mut journal, 16, CELL, EventKind::CodeUpdate, "update");
+    let verdict = gate_code_update(&mut journal, &KEY, EPOCH, CELL, update_seq, &before, &after).expect("gate");
     match verdict {
         GateVerdict::Reject { malformed, .. } => assert_eq!(malformed, vec![bad_seq]),
         GateVerdict::Allow => panic!("malformed revoke in before must fail closed"),
